@@ -140,6 +140,7 @@ All three OCWs run on same node and sign. **This is ONLY for testing pallet thre
 
 **Implementation:**
 ```rust
+
 MaxExpiriesPerBlock = 50    // Max 50 expiries per block
 MaxAutoFinalizePerBlock = 50 // Max 50 finalizations per block
 ```
