@@ -26,6 +26,7 @@ exec "${NODE_BIN}" \
   --validator \
   --port 30334 \
   --rpc-port 9945 \
+  --unsafe-rpc-external \
   --rpc-cors all \
   --rpc-methods safe \
   --offchain-worker always \

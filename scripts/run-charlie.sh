@@ -28,6 +28,7 @@ exec "${NODE_BIN}" \
   --name charlie \
   --port 30335 \
   --rpc-port 9946 \
+  --unsafe-rpc-external \
   --rpc-cors all \
   --rpc-methods safe \
   --offchain-worker always \
