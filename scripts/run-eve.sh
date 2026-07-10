@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ============================================================
+# scripts/run-eve.sh
+# Attester-only node (not a block author).
+# Same shape as run-dave.sh, different ports + base-path.
+#
+# Prereq: ./scripts/setup-keys.sh ./data/eve local //Eve
+# ============================================================
+set -euo pipefail
+
+BASE_PATH="${BASE_PATH:-./data/eve}"
+NODE_BIN="${NODE_BIN:-./target/release/solochain-template-node}"
+ALICE_PEER_ID="${ALICE_PEER_ID:-12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp}"
+
+if [[ ! -d "${BASE_PATH}/chains" ]]; then
+  echo "no keystore at ${BASE_PATH} — run:" >&2
+  echo "  ./scripts/setup-keys.sh ${BASE_PATH} local //Eve" >&2
+  exit 1
+fi
+
+exec "${NODE_BIN}" \
+  --base-path "${BASE_PATH}" \
+  --chain local \
+  --name eve \
+  --port 30337 \
+  --rpc-port 9948 \
+  --unsafe-rpc-external \
+  --rpc-cors all \
+  --rpc-methods safe \
+  --offchain-worker always \
+  --enable-offchain-indexing true \
+  --bootnodes "/ip4/127.0.0.1/tcp/30333/p2p/${ALICE_PEER_ID}"
