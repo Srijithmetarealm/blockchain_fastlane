@@ -600,6 +600,19 @@ pub mod pallet {
                 }
             }
 
+            // §14: populate each authority's BLS public key from its
+            // deterministic seed so offchain workers can BLS-sign attestations
+            // from genesis (no manual register_bls_key needed on a fresh chain).
+            for authority in &self.authorities {
+                let seed = Pallet::<T>::bls_seed(authority);
+                let pubkey = Pallet::<T>::bls_public_from_seed(&seed);
+                if let Ok(bounded) =
+                    TryInto::<BoundedVec<u8, ConstU32<128>>>::try_into(pubkey)
+                {
+                    AuthorityBlsKeys::<T>::insert(authority, bounded);
+                }
+            }
+
             Authorities::<T>::put(bounded);
             Threshold::<T>::put(self.threshold);
         }
@@ -809,6 +822,27 @@ pub mod pallet {
                         let xt = T::create_inherent(call.into());
                         let _ = SubmitTransaction::<T, Call<T>>::submit_transaction(xt);
                     }
+
+                    // §14: also submit a real BLS attestation for this payload.
+                    // Deterministic no_std signing (SecretKeyVT), so it runs
+                    // right here in the OCW. Skips if the authority has no BLS
+                    // key registered or already BLS-attested this payload.
+                    if AuthorityBlsKeys::<T>::contains_key(&auth)
+                        && !BlsAttestations::<T>::get(payload_id)
+                            .iter()
+                            .any(|(a, _)| a == &auth)
+                    {
+                        let bls_seed = Self::bls_seed(&auth);
+                        let bls_sig = Self::bls_sign_with_seed(&bls_seed, &payload_id);
+                        let bls_call = Call::attest_bls_unsigned {
+                            payload_id,
+                            authority_encoded: auth.encode(),
+                            signature: bls_sig,
+                        };
+                        let bls_xt = T::create_inherent(bls_call.into());
+                        let _ =
+                            SubmitTransaction::<T, Call<T>>::submit_transaction(bls_xt);
+                    }
                 }
             }
         }
@@ -880,6 +914,52 @@ pub mod pallet {
                     .priority(100)
                     .longevity(5)
                     .and_provides((payload_id, authority_encoded))
+                    .propagate(true)
+                    .build()
+            } else if let Call::attest_bls_unsigned {
+                payload_id,
+                authority_encoded,
+                signature,
+            } = call
+            {
+                // The payload must exist and be unexpired; the BLS signature
+                // must verify against the authority's registered key. That
+                // verification is the proof of authenticity for this unsigned tx.
+                let payload = Payloads::<T>::get(payload_id)
+                    .ok_or(InvalidTransaction::Stale)?;
+                let now = frame_system::Pallet::<T>::block_number();
+                if now > payload.expiry {
+                    return InvalidTransaction::Stale.into();
+                }
+
+                let authority = T::AccountId::decode(
+                    &mut authority_encoded.as_slice(),
+                )
+                .map_err(|_| InvalidTransaction::BadProof)?;
+
+                let authorities = Authorities::<T>::get();
+                if !authorities.contains(&authority) {
+                    return InvalidTransaction::BadProof.into();
+                }
+
+                // Already collected this authority's BLS signature? Stale.
+                if BlsAttestations::<T>::get(payload_id)
+                    .iter()
+                    .any(|(a, _)| a == &authority)
+                {
+                    return InvalidTransaction::Stale.into();
+                }
+
+                let pubkey = AuthorityBlsKeys::<T>::get(&authority)
+                    .ok_or(InvalidTransaction::BadProof)?;
+                if !Self::bls_verify_single(payload_id, pubkey.as_slice(), signature) {
+                    return InvalidTransaction::BadProof.into();
+                }
+
+                ValidTransaction::with_tag_prefix("FastLaneBlsAttest")
+                    .priority(100)
+                    .longevity(5)
+                    .and_provides((b"bls", payload_id, authority_encoded))
                     .propagate(true)
                     .build()
             } else {
@@ -1275,52 +1355,27 @@ pub mod pallet {
             signature: Vec<u8>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let authorities = Authorities::<T>::get();
-            ensure!(authorities.contains(&who), Error::<T>::NotAuthority);
+            Self::do_attest_bls(payload_id, who, signature)
+        }
 
-            let payload = Payloads::<T>::get(payload_id)
-                .ok_or(Error::<T>::PayloadNotFound)?;
-            let now = frame_system::Pallet::<T>::block_number();
-            ensure!(payload.expiry > now, Error::<T>::PayloadExpired);
-
-            let pubkey = AuthorityBlsKeys::<T>::get(&who)
-                .ok_or(Error::<T>::BlsKeyNotRegistered)?;
-
-            // Verify this authority's individual BLS signature over the payload.
-            ensure!(
-                Self::bls_verify_single(&payload_id, pubkey.as_slice(), &signature),
-                Error::<T>::InvalidBlsSignature
-            );
-
-            let mut recs = BlsAttestations::<T>::get(payload_id);
-            ensure!(
-                !recs.iter().any(|(a, _)| a == &who),
-                Error::<T>::BlsAlreadyAttested
-            );
-            let sig_bounded: BoundedVec<u8, ConstU32<64>> = signature
-                .try_into()
+        // ----------------------------------------------------
+        // attest_bls_unsigned — the unsigned BLS variant an authority's
+        // offchain worker submits automatically. The BLS signature itself
+        // authenticates the authority (it must verify against the on-chain
+        // registered key), so no outer sr25519 signature is needed.
+        // ----------------------------------------------------
+        #[pallet::call_index(11)]
+        #[pallet::weight(T::WeightInfo::attest_unsigned())]
+        pub fn attest_bls_unsigned(
+            origin: OriginFor<T>,
+            payload_id: PayloadId,
+            authority_encoded: Vec<u8>,
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            ensure_none(origin)?;
+            let authority = T::AccountId::decode(&mut authority_encoded.as_slice())
                 .map_err(|_| Error::<T>::InvalidBlsSignature)?;
-            recs.try_push((who.clone(), sig_bounded))
-                .map_err(|_| Error::<T>::AlreadyAttested)?;
-            BlsAttestations::<T>::insert(payload_id, recs.clone());
-
-            // At threshold: collapse every collected signature into one.
-            let threshold = Threshold::<T>::get();
-            if threshold > 0 && recs.len() as u32 >= threshold {
-                let sigs: Vec<Vec<u8>> =
-                    recs.iter().map(|(_, s)| s.to_vec()).collect();
-                if let Some(agg) = Self::aggregate_bls_signatures(&sigs) {
-                    let agg_bounded: BoundedVec<u8, ConstU32<64>> = agg
-                        .try_into()
-                        .map_err(|_| Error::<T>::InvalidBlsSignature)?;
-                    BlsAggregate::<T>::insert(payload_id, agg_bounded);
-                    Self::deposit_event(Event::BlsAggregated {
-                        payload_id,
-                        count: recs.len() as u32,
-                    });
-                }
-            }
-            Ok(())
+            Self::do_attest_bls(payload_id, authority, signature)
         }
     }
 
@@ -1505,6 +1560,70 @@ pub mod pallet {
             use w3f_bls::{SecretKeyVT, SerializableToBytes, TinyBLS381};
             let sk = SecretKeyVT::<TinyBLS381>::from_seed(seed);
             sk.sign(&Self::bls_message(payload_id)).to_bytes()
+        }
+
+        /// Deterministic per-authority BLS seed. DEMO-grade: derived from the
+        /// (public) account so genesis and each authority's OCW agree without
+        /// key distribution — it is NOT secret. A production deployment would
+        /// use random per-node BLS keys registered via `register_bls_key`.
+        pub fn bls_seed(authority: &T::AccountId) -> [u8; 32] {
+            sp_io::hashing::blake2_256(&(b"fastlane-bls-seed", authority).encode())
+        }
+
+        /// Shared BLS-attestation logic for `attest_bls` (signed) and
+        /// `attest_bls_unsigned` (OCW). Verifies the authority's single BLS
+        /// signature against its registered key, records it, and once the
+        /// threshold is reached stores the single aggregate signature. Does not
+        /// require the payload to still be `Submitted`, so BLS attestations can
+        /// complete independently of the sr25519 finalisation race.
+        fn do_attest_bls(
+            payload_id: PayloadId,
+            authority: T::AccountId,
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&authority), Error::<T>::NotAuthority);
+
+            let payload = Payloads::<T>::get(payload_id)
+                .ok_or(Error::<T>::PayloadNotFound)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(payload.expiry > now, Error::<T>::PayloadExpired);
+
+            let pubkey = AuthorityBlsKeys::<T>::get(&authority)
+                .ok_or(Error::<T>::BlsKeyNotRegistered)?;
+            ensure!(
+                Self::bls_verify_single(&payload_id, pubkey.as_slice(), &signature),
+                Error::<T>::InvalidBlsSignature
+            );
+
+            let mut recs = BlsAttestations::<T>::get(payload_id);
+            ensure!(
+                !recs.iter().any(|(a, _)| a == &authority),
+                Error::<T>::BlsAlreadyAttested
+            );
+            let sig_bounded: BoundedVec<u8, ConstU32<64>> = signature
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidBlsSignature)?;
+            recs.try_push((authority, sig_bounded))
+                .map_err(|_| Error::<T>::AlreadyAttested)?;
+            BlsAttestations::<T>::insert(payload_id, recs.clone());
+
+            let threshold = Threshold::<T>::get();
+            if threshold > 0 && recs.len() as u32 >= threshold {
+                let sigs: Vec<Vec<u8>> =
+                    recs.iter().map(|(_, s)| s.to_vec()).collect();
+                if let Some(agg) = Self::aggregate_bls_signatures(&sigs) {
+                    let agg_bounded: BoundedVec<u8, ConstU32<64>> = agg
+                        .try_into()
+                        .map_err(|_| Error::<T>::InvalidBlsSignature)?;
+                    BlsAggregate::<T>::insert(payload_id, agg_bounded);
+                    Self::deposit_event(Event::BlsAggregated {
+                        payload_id,
+                        count: recs.len() as u32,
+                    });
+                }
+            }
+            Ok(())
         }
 
         /// §14 — in-runtime BLS12-381 aggregate verification.

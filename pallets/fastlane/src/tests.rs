@@ -871,18 +871,67 @@ fn attest_bls_rejects_unregistered_and_bad_signature() {
         submit_payload(dave(), 0, 100, 1, [7u8; 32]);
         let pid = payload_id_for(dave(), 0, 1, [7u8; 32]);
 
-        // No BLS key registered → rejected.
+        // Remove alice's genesis BLS key → unregistered path is rejected.
+        crate::pallet::AuthorityBlsKeys::<Test>::remove(&alice());
         assert_noop!(
             Fastlane::attest_bls(RuntimeOrigin::signed(alice()), pid, vec![0u8; 48]),
             Error::<Test>::BlsKeyNotRegistered
         );
 
-        // Registered, but a bogus signature → rejected.
-        let pk = Fastlane::bls_public_from_seed(&[1u8; 32]);
-        assert_ok!(Fastlane::register_bls_key(RuntimeOrigin::signed(alice()), pk));
+        // With a genesis key in place (bob), a bogus signature is rejected.
         assert_noop!(
-            Fastlane::attest_bls(RuntimeOrigin::signed(alice()), pid, vec![7u8; 48]),
+            Fastlane::attest_bls(RuntimeOrigin::signed(bob()), pid, vec![7u8; 48]),
             Error::<Test>::InvalidBlsSignature
         );
+    });
+}
+
+#[test]
+fn genesis_populates_bls_keys() {
+    three_auth_ext().execute_with(|| {
+        for a in [alice(), bob(), charlie()] {
+            let stored = crate::pallet::AuthorityBlsKeys::<Test>::get(&a)
+                .expect("genesis BLS key present")
+                .into_inner();
+            let expected = Fastlane::bls_public_from_seed(&Fastlane::bls_seed(&a));
+            assert_eq!(stored, expected, "genesis key must match deterministic seed");
+        }
+    });
+}
+
+#[test]
+fn attest_bls_unsigned_aggregates_from_ocw() {
+    use codec::Encode;
+    three_auth_ext().execute_with(|| {
+        submit_payload(dave(), 0, 100, 1, [7u8; 32]);
+        let pid = payload_id_for(dave(), 0, 1, [7u8; 32]);
+
+        // Simulate each authority's OCW: sign with its deterministic seed and
+        // submit the UNSIGNED BLS attestation (threshold = 2).
+        for a in [alice(), bob()] {
+            let seed = Fastlane::bls_seed(&a);
+            let sig = Fastlane::bls_sign_with_seed(&seed, &pid);
+            assert_ok!(Fastlane::attest_bls_unsigned(
+                RuntimeOrigin::none(),
+                pid,
+                a.encode(),
+                sig
+            ));
+        }
+
+        // One aggregate stored, verifying against the genesis-registered keys.
+        let agg = crate::pallet::BlsAggregate::<Test>::get(pid)
+            .expect("aggregate stored at threshold")
+            .into_inner();
+        assert_eq!(agg.len(), 48);
+        let pks: Vec<Vec<u8>> = [alice(), bob()]
+            .iter()
+            .map(|a| {
+                crate::pallet::AuthorityBlsKeys::<Test>::get(a)
+                    .unwrap()
+                    .into_inner()
+            })
+            .collect();
+        assert!(Fastlane::verify_bls_aggregate(b"fastlane-attest", &pid, &pks, &agg));
     });
 }
