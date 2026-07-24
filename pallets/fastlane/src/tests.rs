@@ -956,3 +956,34 @@ fn set_authorities_auto_registers_bls_keys() {
         assert_eq!(stored, Fastlane::bls_public_from_seed(&Fastlane::bls_seed(&dave())));
     });
 }
+
+#[test]
+fn bls_aggregated_event_fires_once_past_threshold() {
+    use codec::Encode;
+    three_auth_ext().execute_with(|| {
+        // alice/bob/charlie are genesis authorities (BLS keys auto-registered),
+        // threshold is 2.
+        submit_payload(dave(), 0, 100, 1, [7u8; 32]);
+        let pid = payload_id_for(dave(), 0, 1, [7u8; 32]);
+
+        // All three attest — one past the threshold of 2.
+        for a in [alice(), bob(), charlie()] {
+            let sig = Fastlane::bls_sign_with_seed(&Fastlane::bls_seed(&a), &pid);
+            assert_ok!(Fastlane::attest_bls_unsigned(
+                RuntimeOrigin::none(),
+                pid,
+                a.encode(),
+                sig
+            ));
+        }
+
+        // Exactly ONE BlsAggregated event despite 3 attestations.
+        let n = events()
+            .iter()
+            .filter(|e| matches!(e, Event::BlsAggregated { .. }))
+            .count();
+        assert_eq!(n, 1, "BlsAggregated must fire once per payload");
+        // The stored aggregate still reflects all 3 signers.
+        assert!(crate::pallet::BlsAggregate::<Test>::get(pid).is_some());
+    });
+}

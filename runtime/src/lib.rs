@@ -94,7 +94,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 105 -> 106: OCW auto-BLS (attest_bls_unsigned, call 11) + genesis BLS keys
 	// + set_authorities now auto-registers a BLS key for each new authority, so
 	// BLS keeps working after governance authority changes. Additive; no migration.
-	spec_version: 106,
+	// 106 -> 107: BlsAggregated event now fires once per payload (when the
+	// aggregate is first created) instead of once per attestation past the
+	// threshold. Behaviour-only; no storage change.
+	spec_version: 107,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the

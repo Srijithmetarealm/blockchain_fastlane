@@ -1629,14 +1629,22 @@ pub mod pallet {
                 let sigs: Vec<Vec<u8>> =
                     recs.iter().map(|(_, s)| s.to_vec()).collect();
                 if let Some(agg) = Self::aggregate_bls_signatures(&sigs) {
+                    // Emit BlsAggregated only the first time the aggregate is
+                    // created. The stored aggregate is still refreshed as more
+                    // sign-offs arrive (so it stays verifiable against the full
+                    // signer set), but the event fires once per payload — not
+                    // once per attestation past the threshold.
+                    let first_time = !BlsAggregate::<T>::contains_key(payload_id);
                     let agg_bounded: BoundedVec<u8, ConstU32<64>> = agg
                         .try_into()
                         .map_err(|_| Error::<T>::InvalidBlsSignature)?;
                     BlsAggregate::<T>::insert(payload_id, agg_bounded);
-                    Self::deposit_event(Event::BlsAggregated {
-                        payload_id,
-                        count: recs.len() as u32,
-                    });
+                    if first_time {
+                        Self::deposit_event(Event::BlsAggregated {
+                            payload_id,
+                            count: recs.len() as u32,
+                        });
+                    }
                 }
             }
             Ok(())
