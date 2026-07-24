@@ -91,7 +91,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// attest_bls (call 10) plus AuthorityBlsKeys / BlsAttestations / BlsAggregate
 	// storage. Purely additive: new call indices and new (empty-by-default)
 	// storage, existing sr25519 attestation flow untouched. No migration.
-	spec_version: 105,
+	// 105 -> 106: OCW auto-BLS (attest_bls_unsigned, call 11) + genesis BLS keys
+	// + set_authorities now auto-registers a BLS key for each new authority, so
+	// BLS keeps working after governance authority changes. Additive; no migration.
+	spec_version: 106,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the
@@ -99,7 +102,8 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 2 -> 3: template pallet gained a new extrinsic (call index 2,
 	// `do_something_gated`), extending the transaction interface again.
 	// 3 -> 4: fastlane gained register_bls_key (9) and attest_bls (10).
-	transaction_version: 4,
+	// 4 -> 5: fastlane gained attest_bls_unsigned (11).
+	transaction_version: 5,
 	system_version: 1,
 };
 

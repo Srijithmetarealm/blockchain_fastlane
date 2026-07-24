@@ -935,3 +935,24 @@ fn attest_bls_unsigned_aggregates_from_ocw() {
         assert!(Fastlane::verify_bls_aggregate(b"fastlane-attest", &pid, &pks, &agg));
     });
 }
+
+#[test]
+fn set_authorities_auto_registers_bls_keys() {
+    three_auth_ext().execute_with(|| {
+        // dave is not a genesis authority, so he has no BLS key yet.
+        assert!(crate::pallet::AuthorityBlsKeys::<Test>::get(&dave()).is_none());
+
+        // Bond dave, then add him to the authority set via governance.
+        assert_ok!(Fastlane::post_bond(RuntimeOrigin::signed(dave()), MIN_BOND));
+        assert_ok!(Fastlane::set_authorities(
+            RuntimeOrigin::root(),
+            frame_support::BoundedVec::try_from(vec![alice(), bob(), charlie(), dave()]).unwrap()
+        ));
+
+        // dave now has an auto-registered BLS key matching his deterministic seed.
+        let stored = crate::pallet::AuthorityBlsKeys::<Test>::get(&dave())
+            .expect("set_authorities must auto-register a BLS key")
+            .into_inner();
+        assert_eq!(stored, Fastlane::bls_public_from_seed(&Fastlane::bls_seed(&dave())));
+    });
+}

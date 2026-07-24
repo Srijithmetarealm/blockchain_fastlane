@@ -1116,6 +1116,22 @@ pub mod pallet {
                 ensure!(bonded >= T::MinAuthorityBond::get(), Error::<T>::BondTooLow);
             }
 
+            // §14: auto-register a BLS key for any new authority that lacks one,
+            // mirroring genesis. Ensures BLS attestation works immediately after
+            // an authority-set change — no manual register_bls_key needed.
+            // Existing registrations are left untouched.
+            for auth in new_authorities.iter() {
+                if !AuthorityBlsKeys::<T>::contains_key(auth) {
+                    let seed = Self::bls_seed(auth);
+                    let pubkey = Self::bls_public_from_seed(&seed);
+                    if let Ok(bounded) =
+                        TryInto::<BoundedVec<u8, ConstU32<128>>>::try_into(pubkey)
+                    {
+                        AuthorityBlsKeys::<T>::insert(auth, bounded);
+                    }
+                }
+            }
+
             let count = new_authorities.len() as u32;
             Authorities::<T>::put(new_authorities);
             Self::deposit_event(Event::AuthoritiesUpdated { count });
