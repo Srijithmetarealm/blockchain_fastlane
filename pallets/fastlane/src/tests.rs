@@ -808,3 +808,81 @@ fn slash_broken_inclusion_rejected_before_deadline() {
         );
     });
 }
+
+// ============================================================
+// §14 — real on-chain BLS attestation + aggregation
+// ============================================================
+
+#[test]
+fn bls_attestation_aggregates_on_chain() {
+    three_auth_ext().execute_with(|| {
+        // Each authority's OCW holds a BLS seed; the public key is registered.
+        let alice_seed = [1u8; 32];
+        let bob_seed = [2u8; 32];
+        let alice_pk = Fastlane::bls_public_from_seed(&alice_seed);
+        let bob_pk = Fastlane::bls_public_from_seed(&bob_seed);
+        assert_ok!(Fastlane::register_bls_key(
+            RuntimeOrigin::signed(alice()),
+            alice_pk.clone()
+        ));
+        assert_ok!(Fastlane::register_bls_key(
+            RuntimeOrigin::signed(bob()),
+            bob_pk.clone()
+        ));
+
+        // A payload is submitted.
+        let expiry = 100;
+        submit_payload(dave(), 0, expiry, 1, [7u8; 32]);
+        let pid = payload_id_for(dave(), 0, 1, [7u8; 32]);
+
+        // Two authorities (threshold = 2) BLS-sign the payload and attest.
+        let sig_a = Fastlane::bls_sign_with_seed(&alice_seed, &pid);
+        let sig_b = Fastlane::bls_sign_with_seed(&bob_seed, &pid);
+        assert_ok!(Fastlane::attest_bls(RuntimeOrigin::signed(alice()), pid, sig_a));
+        assert_ok!(Fastlane::attest_bls(RuntimeOrigin::signed(bob()), pid, sig_b));
+
+        // A single 48-byte aggregate signature is stored (real §14 reduction).
+        let agg = crate::pallet::BlsAggregate::<Test>::get(pid)
+            .expect("aggregate stored at threshold")
+            .into_inner();
+        assert_eq!(agg.len(), 48);
+
+        // The stored aggregate verifies against the two signers' public keys.
+        assert!(Fastlane::verify_bls_aggregate(
+            b"fastlane-attest",
+            &pid,
+            &[alice_pk.clone(), bob_pk.clone()],
+            &agg
+        ));
+        // …and does NOT verify against a different payload id.
+        let wrong = [9u8; 32];
+        assert!(!Fastlane::verify_bls_aggregate(
+            b"fastlane-attest",
+            &wrong,
+            &[alice_pk, bob_pk],
+            &agg
+        ));
+    });
+}
+
+#[test]
+fn attest_bls_rejects_unregistered_and_bad_signature() {
+    three_auth_ext().execute_with(|| {
+        submit_payload(dave(), 0, 100, 1, [7u8; 32]);
+        let pid = payload_id_for(dave(), 0, 1, [7u8; 32]);
+
+        // No BLS key registered → rejected.
+        assert_noop!(
+            Fastlane::attest_bls(RuntimeOrigin::signed(alice()), pid, vec![0u8; 48]),
+            Error::<Test>::BlsKeyNotRegistered
+        );
+
+        // Registered, but a bogus signature → rejected.
+        let pk = Fastlane::bls_public_from_seed(&[1u8; 32]);
+        assert_ok!(Fastlane::register_bls_key(RuntimeOrigin::signed(alice()), pk));
+        assert_noop!(
+            Fastlane::attest_bls(RuntimeOrigin::signed(alice()), pid, vec![7u8; 48]),
+            Error::<Test>::InvalidBlsSignature
+        );
+    });
+}

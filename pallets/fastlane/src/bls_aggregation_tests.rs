@@ -104,3 +104,47 @@ fn bls_aggregate_rejects_wrong_payload() {
 	let agg_ref: &SignatureAggregatorAssumingPoP<Engine> = &agg;
 	assert!(!agg_ref.verify(), "aggregate over the wrong payload must NOT verify");
 }
+
+/// End-to-end check of the *in-runtime* verifier `Pallet::verify_bls_aggregate`
+/// (the no_std path that compiles into the WASM): build a real aggregate with
+/// the std helper, serialise it to bytes, and confirm the runtime function
+/// accepts the valid aggregate and rejects a wrong payload id.
+#[test]
+fn in_runtime_verify_bls_aggregate_matches() {
+	use crate::mock::Test;
+	use crate::pallet::Pallet;
+
+	let ctx = b"fastlane-attest";
+	let payload_id = [7u8; 32];
+	let message = payload_message(&payload_id);
+
+	let n = 5usize;
+	let mut keypairs: sp_std::vec::Vec<Keypair<Engine>> =
+		(0..n).map(|_| Keypair::<Engine>::generate(thread_rng())).collect();
+	let sigs: sp_std::vec::Vec<Signature<Engine>> =
+		keypairs.iter_mut().map(|k| k.sign(&message)).collect();
+
+	// Aggregate signature (sum of sigs, PoP assumption) serialised to bytes.
+	let mut agg = SignatureAggregatorAssumingPoP::<Engine>::new(message.clone());
+	for s in &sigs {
+		agg.add_signature(s);
+	}
+	let agg_sig_bytes = {
+		let r: &SignatureAggregatorAssumingPoP<Engine> = &agg;
+		r.signature().to_bytes()
+	};
+	let pubkey_bytes: sp_std::vec::Vec<sp_std::vec::Vec<u8>> =
+		keypairs.iter().map(|k| k.public.to_bytes()).collect();
+
+	// Valid aggregate is accepted by the in-runtime verifier.
+	assert!(
+		Pallet::<Test>::verify_bls_aggregate(ctx, &payload_id, &pubkey_bytes, &agg_sig_bytes),
+		"runtime verifier must accept a valid aggregate"
+	);
+	// Same aggregate against a different payload id must be rejected.
+	let wrong = [8u8; 32];
+	assert!(
+		!Pallet::<Test>::verify_bls_aggregate(ctx, &wrong, &pubkey_bytes, &agg_sig_bytes),
+		"runtime verifier must reject a wrong payload id"
+	);
+}

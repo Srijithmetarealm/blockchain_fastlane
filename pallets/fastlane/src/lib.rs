@@ -37,7 +37,7 @@ pub mod pallet {
 
     use frame_support::{
         pallet_prelude::*,
-        traits::{Currency, ReservableCurrency},
+        traits::{ConstU32, Currency, ReservableCurrency},
     };
 
     use frame_system::{
@@ -350,6 +350,48 @@ pub mod pallet {
     >;
 
     // --------------------------------------------------------
+    // §14 real-BLS storage
+    // --------------------------------------------------------
+
+    /// Per-authority registered BLS12-381 public key (w3f-bls compressed bytes,
+    /// TinyBLS381 public group ≈ 96 bytes). Set via `register_bls_key`.
+    #[pallet::storage]
+    #[pallet::getter(fn authority_bls_key)]
+    pub type AuthorityBlsKeys<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        BoundedVec<u8, ConstU32<128>>,
+        OptionQuery,
+    >;
+
+    /// Raw per-authority BLS signatures collected for a payload, before they are
+    /// collapsed into a single aggregate. Each signature ≈ 48 bytes (G1).
+    #[pallet::storage]
+    #[pallet::getter(fn bls_attestations)]
+    pub type BlsAttestations<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        PayloadId,
+        BoundedVec<(T::AccountId, BoundedVec<u8, ConstU32<64>>), T::MaxAuthorities>,
+        ValueQuery,
+    >;
+
+    /// The single aggregated BLS signature for a payload, written once the
+    /// threshold is reached. This is the real §14 storage reduction: N × 48-byte
+    /// signatures collapse to one 48-byte aggregate that still verifies against
+    /// the committee's public keys.
+    #[pallet::storage]
+    #[pallet::getter(fn bls_aggregate)]
+    pub type BlsAggregate<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        PayloadId,
+        BoundedVec<u8, ConstU32<64>>,
+        OptionQuery,
+    >;
+
+    // --------------------------------------------------------
     // Events
     // --------------------------------------------------------
 
@@ -385,6 +427,11 @@ pub mod pallet {
             authority: T::AccountId,
             deadline: BlockNumberFor<T>,
         },
+        /// An authority registered its BLS public key (§14).
+        BlsKeyRegistered { authority: T::AccountId },
+        /// Threshold BLS attestations collected — collapsed into one aggregate
+        /// signature stored in `BlsAggregate` (§14 real signature aggregation).
+        BlsAggregated { payload_id: PayloadId, count: u32 },
     }
 
     // --------------------------------------------------------
@@ -419,6 +466,14 @@ pub mod pallet {
         AlreadyCommitted,
         /// Inclusion deadline must be strictly in the future.
         InvalidDeadline,
+        /// The authority has not registered a BLS public key.
+        BlsKeyNotRegistered,
+        /// The supplied bytes are not a valid BLS public key.
+        InvalidBlsPublicKey,
+        /// The BLS signature failed verification against the registered key.
+        InvalidBlsSignature,
+        /// This authority already submitted a BLS attestation for the payload.
+        BlsAlreadyAttested,
     }
 
     // --------------------------------------------------------
@@ -1175,6 +1230,98 @@ pub mod pallet {
             });
             Ok(())
         }
+
+        // ----------------------------------------------------
+        // register_bls_key — an authority registers its BLS public key (§14).
+        // ----------------------------------------------------
+        #[pallet::call_index(9)]
+        #[pallet::weight(T::WeightInfo::attest())]
+        pub fn register_bls_key(
+            origin: OriginFor<T>,
+            public_key: Vec<u8>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&who), Error::<T>::NotAuthority);
+
+            // The bytes must parse as a real BLS public key.
+            ensure!(
+                Self::bls_public_key_valid(&public_key),
+                Error::<T>::InvalidBlsPublicKey
+            );
+            let bounded: BoundedVec<u8, ConstU32<128>> = public_key
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidBlsPublicKey)?;
+            AuthorityBlsKeys::<T>::insert(&who, bounded);
+
+            Self::deposit_event(Event::BlsKeyRegistered { authority: who });
+            Ok(())
+        }
+
+        // ----------------------------------------------------
+        // attest_bls — an authority submits a real BLS attestation (§14).
+        //
+        // Verifies the single BLS signature against the caller's registered
+        // key. Once the threshold is reached, all collected BLS signatures are
+        // summed into ONE aggregate signature (constant 48 bytes regardless of
+        // committee size) and stored in `BlsAggregate` — the real §14 storage
+        // reduction, verifiable against the committee's public keys.
+        // ----------------------------------------------------
+        #[pallet::call_index(10)]
+        #[pallet::weight(T::WeightInfo::attest())]
+        pub fn attest_bls(
+            origin: OriginFor<T>,
+            payload_id: PayloadId,
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&who), Error::<T>::NotAuthority);
+
+            let payload = Payloads::<T>::get(payload_id)
+                .ok_or(Error::<T>::PayloadNotFound)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(payload.expiry > now, Error::<T>::PayloadExpired);
+
+            let pubkey = AuthorityBlsKeys::<T>::get(&who)
+                .ok_or(Error::<T>::BlsKeyNotRegistered)?;
+
+            // Verify this authority's individual BLS signature over the payload.
+            ensure!(
+                Self::bls_verify_single(&payload_id, pubkey.as_slice(), &signature),
+                Error::<T>::InvalidBlsSignature
+            );
+
+            let mut recs = BlsAttestations::<T>::get(payload_id);
+            ensure!(
+                !recs.iter().any(|(a, _)| a == &who),
+                Error::<T>::BlsAlreadyAttested
+            );
+            let sig_bounded: BoundedVec<u8, ConstU32<64>> = signature
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidBlsSignature)?;
+            recs.try_push((who.clone(), sig_bounded))
+                .map_err(|_| Error::<T>::AlreadyAttested)?;
+            BlsAttestations::<T>::insert(payload_id, recs.clone());
+
+            // At threshold: collapse every collected signature into one.
+            let threshold = Threshold::<T>::get();
+            if threshold > 0 && recs.len() as u32 >= threshold {
+                let sigs: Vec<Vec<u8>> =
+                    recs.iter().map(|(_, s)| s.to_vec()).collect();
+                if let Some(agg) = Self::aggregate_bls_signatures(&sigs) {
+                    let agg_bounded: BoundedVec<u8, ConstU32<64>> = agg
+                        .try_into()
+                        .map_err(|_| Error::<T>::InvalidBlsSignature)?;
+                    BlsAggregate::<T>::insert(payload_id, agg_bounded);
+                    Self::deposit_event(Event::BlsAggregated {
+                        payload_id,
+                        count: recs.len() as u32,
+                    });
+                }
+            }
+            Ok(())
+        }
     }
 
     // --------------------------------------------------------
@@ -1293,6 +1440,119 @@ pub mod pallet {
                 Error::<T>::InvalidSignature
             );
             Ok(())
+        }
+
+        /// Canonical BLS attestation message. Every authority signs
+        /// `Message::new(b"fastlane-attest", payload_id)`, so their signatures
+        /// share a message and therefore aggregate.
+        fn bls_message(payload_id: &PayloadId) -> w3f_bls::Message {
+            w3f_bls::Message::new(b"fastlane-attest", payload_id)
+        }
+
+        /// True if `bytes` decode to a valid BLS12-381 (TinyBLS381) public key.
+        fn bls_public_key_valid(bytes: &[u8]) -> bool {
+            use w3f_bls::{PublicKey, SerializableToBytes, TinyBLS381};
+            PublicKey::<TinyBLS381>::from_bytes(bytes).is_ok()
+        }
+
+        /// Verify one authority's BLS signature over `payload_id` against its
+        /// public key. Runs in-runtime (no host function).
+        fn bls_verify_single(
+            payload_id: &PayloadId,
+            pubkey_bytes: &[u8],
+            sig_bytes: &[u8],
+        ) -> bool {
+            use w3f_bls::{PublicKey, SerializableToBytes, Signature, TinyBLS381};
+            type Engine = TinyBLS381;
+            let pk = match PublicKey::<Engine>::from_bytes(pubkey_bytes) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let sig = match Signature::<Engine>::from_bytes(sig_bytes) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            sig.verify(&Self::bls_message(payload_id), &pk)
+        }
+
+        /// Collapse a set of raw BLS signatures into one aggregate signature by
+        /// summing their group points. Returns the aggregate's compressed bytes.
+        fn aggregate_bls_signatures(sigs: &[Vec<u8>]) -> Option<Vec<u8>> {
+            use w3f_bls::{SerializableToBytes, Signature, TinyBLS381};
+            type Engine = TinyBLS381;
+            let mut iter = sigs.iter();
+            let mut agg = Signature::<Engine>::from_bytes(iter.next()?).ok()?;
+            for s in iter {
+                let sig = Signature::<Engine>::from_bytes(s).ok()?;
+                agg.0 += sig.0;
+            }
+            Some(agg.to_bytes())
+        }
+
+        /// Deterministically derive an authority's BLS **public** key bytes from
+        /// a 32-byte seed. The matching secret never leaves the signer; the OCW
+        /// keeps it in node-local offchain storage. Used to populate genesis /
+        /// `register_bls_key`.
+        pub fn bls_public_from_seed(seed: &[u8]) -> Vec<u8> {
+            use w3f_bls::{SecretKeyVT, SerializableToBytes, TinyBLS381};
+            SecretKeyVT::<TinyBLS381>::from_seed(seed).into_public().to_bytes()
+        }
+
+        /// Deterministically BLS-sign `payload_id` with the secret derived from
+        /// `seed`. `SecretKeyVT::sign` is no_std and deterministic (no RNG), so
+        /// this is exactly what an authority's offchain worker calls to attest.
+        pub fn bls_sign_with_seed(seed: &[u8], payload_id: &PayloadId) -> Vec<u8> {
+            use w3f_bls::{SecretKeyVT, SerializableToBytes, TinyBLS381};
+            let sk = SecretKeyVT::<TinyBLS381>::from_seed(seed);
+            sk.sign(&Self::bls_message(payload_id)).to_bytes()
+        }
+
+        /// §14 — in-runtime BLS12-381 aggregate verification.
+        ///
+        /// Verifies that `aggregate_sig` is the BLS aggregate of signatures by
+        /// every key in `pubkeys`, each over the same message
+        /// `Message::new(ctx, payload_id)`. Runs entirely inside the runtime
+        /// WASM (no `bls381_*` host function required), so activating real BLS
+        /// is a forkless runtime upgrade — no node-binary rebuild or validator
+        /// redeploy. `pubkeys`/`aggregate_sig` are `w3f_bls` compressed byte
+        /// encodings. This is the on-chain verify half of the BLS path; the OCW
+        /// signing half is wired separately.
+        pub fn verify_bls_aggregate(
+            ctx: &[u8],
+            payload_id: &PayloadId,
+            pubkeys: &[Vec<u8>],
+            aggregate_sig: &[u8],
+        ) -> bool {
+            // Uses only the no_std-available w3f-bls API (the convenience
+            // `single_pop_aggregator` is std-only). Same-message BLS aggregate
+            // verification: the aggregate signature verifies against the SUM of
+            // the signers' public keys.
+            use w3f_bls::{Message, PublicKey, SerializableToBytes, Signature, TinyBLS381};
+            type Engine = TinyBLS381;
+
+            if pubkeys.is_empty() {
+                return false;
+            }
+            let message = Message::new(ctx, payload_id);
+            let sig = match Signature::<Engine>::from_bytes(aggregate_sig) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+
+            // Aggregate the public keys by summing their group points.
+            let mut iter = pubkeys.iter();
+            let mut agg_pk = match PublicKey::<Engine>::from_bytes(iter.next().unwrap()) {
+                Ok(pk) => pk,
+                Err(_) => return false,
+            };
+            for pk_bytes in iter {
+                match PublicKey::<Engine>::from_bytes(pk_bytes) {
+                    Ok(pk) => agg_pk.0 += pk.0,
+                    Err(_) => return false,
+                }
+            }
+
+            sig.verify(&message, &agg_pk)
         }
 
         /// Canonical message hash an authority signs to commit to including a
