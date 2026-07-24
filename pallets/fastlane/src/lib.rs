@@ -759,6 +759,22 @@ pub mod pallet {
                 return;
             }
 
+            // §14 (production): make sure each local authority's RANDOM BLS
+            // public key is registered on-chain before we attest with it. The
+            // secret is generated once per node and kept in offchain-local
+            // storage — never derived from public data — so BLS attestations
+            // are unforgeable.
+            {
+                let authorities = Authorities::<T>::get();
+                for key_pub in &local_keys {
+                    if let Ok(auth) = T::AccountId::decode(&mut key_pub.0.as_ref()) {
+                        if authorities.contains(&auth) {
+                            Self::ocw_ensure_bls_registered(key_pub, &auth);
+                        }
+                    }
+                }
+            }
+
             for (payload_id, status) in Statuses::<T>::iter() {
                 if status != Status::Submitted {
                     continue;
@@ -823,17 +839,20 @@ pub mod pallet {
                         let _ = SubmitTransaction::<T, Call<T>>::submit_transaction(xt);
                     }
 
-                    // §14: also submit a real BLS attestation for this payload.
-                    // Deterministic no_std signing (SecretKeyVT), so it runs
-                    // right here in the OCW. Skips if the authority has no BLS
-                    // key registered or already BLS-attested this payload.
-                    if AuthorityBlsKeys::<T>::contains_key(&auth)
+                    // §14: also submit a real BLS attestation, signed with this
+                    // node's RANDOM per-node secret. Only once our matching
+                    // public key is registered on-chain (handled above), and
+                    // only if we haven't already BLS-attested this payload.
+                    let ocw_seed = Self::ocw_bls_seed(&auth);
+                    let my_bls_pub = Self::bls_public_from_seed(&ocw_seed);
+                    let registered_match = AuthorityBlsKeys::<T>::get(&auth)
+                        .map_or(false, |k| k.as_slice() == my_bls_pub.as_slice());
+                    if registered_match
                         && !BlsAttestations::<T>::get(payload_id)
                             .iter()
                             .any(|(a, _)| a == &auth)
                     {
-                        let bls_seed = Self::bls_seed(&auth);
-                        let bls_sig = Self::bls_sign_with_seed(&bls_seed, &payload_id);
+                        let bls_sig = Self::bls_sign_with_seed(&ocw_seed, &payload_id);
                         let bls_call = Call::attest_bls_unsigned {
                             payload_id,
                             authority_encoded: auth.encode(),
@@ -960,6 +979,37 @@ pub mod pallet {
                     .priority(100)
                     .longevity(5)
                     .and_provides((b"bls", payload_id, authority_encoded))
+                    .propagate(true)
+                    .build()
+            } else if let Call::register_bls_key_unsigned {
+                authority_encoded,
+                public_key,
+                proof,
+            } = call
+            {
+                let authority = T::AccountId::decode(&mut authority_encoded.as_slice())
+                    .map_err(|_| InvalidTransaction::BadProof)?;
+                let authorities = Authorities::<T>::get();
+                if !authorities.contains(&authority) {
+                    return InvalidTransaction::BadProof.into();
+                }
+                if !Self::bls_public_key_valid(public_key) {
+                    return InvalidTransaction::BadProof.into();
+                }
+                // Already registered with this exact key — nothing to do.
+                if let Some(existing) = AuthorityBlsKeys::<T>::get(&authority) {
+                    if existing.as_slice() == public_key.as_slice() {
+                        return InvalidTransaction::Stale.into();
+                    }
+                }
+                let msg_hash = Self::bls_register_message(public_key);
+                if Self::verify_authority_sig(&authority, &msg_hash, proof).is_err() {
+                    return InvalidTransaction::BadProof.into();
+                }
+                ValidTransaction::with_tag_prefix("FastLaneBlsRegister")
+                    .priority(100)
+                    .longevity(5)
+                    .and_provides((b"blsreg", authority_encoded, public_key))
                     .propagate(true)
                     .build()
             } else {
@@ -1393,6 +1443,42 @@ pub mod pallet {
                 .map_err(|_| Error::<T>::InvalidBlsSignature)?;
             Self::do_attest_bls(payload_id, authority, signature)
         }
+
+        // ----------------------------------------------------
+        // register_bls_key_unsigned — a node self-registers its RANDOM BLS
+        // public key, proven by an sr25519 signature from its authority key.
+        // Production path: the BLS secret is random and node-local, so the
+        // registered key cannot be forged from public data.
+        // ----------------------------------------------------
+        #[pallet::call_index(12)]
+        #[pallet::weight(T::WeightInfo::attest_unsigned())]
+        pub fn register_bls_key_unsigned(
+            origin: OriginFor<T>,
+            authority_encoded: Vec<u8>,
+            public_key: Vec<u8>,
+            proof: Vec<u8>,
+        ) -> DispatchResult {
+            ensure_none(origin)?;
+            let authority = T::AccountId::decode(&mut authority_encoded.as_slice())
+                .map_err(|_| Error::<T>::InvalidBlsPublicKey)?;
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&authority), Error::<T>::NotAuthority);
+            ensure!(
+                Self::bls_public_key_valid(&public_key),
+                Error::<T>::InvalidBlsPublicKey
+            );
+            // Proof: an sr25519 signature by the authority over the canonical
+            // registration message. Only the real authority can produce it.
+            let msg_hash = Self::bls_register_message(&public_key);
+            Self::verify_authority_sig(&authority, &msg_hash, &proof)?;
+
+            let bounded: BoundedVec<u8, ConstU32<128>> = public_key
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidBlsPublicKey)?;
+            AuthorityBlsKeys::<T>::insert(&authority, bounded);
+            Self::deposit_event(Event::BlsKeyRegistered { authority });
+            Ok(())
+        }
     }
 
     // --------------------------------------------------------
@@ -1578,12 +1664,69 @@ pub mod pallet {
             sk.sign(&Self::bls_message(payload_id)).to_bytes()
         }
 
-        /// Deterministic per-authority BLS seed. DEMO-grade: derived from the
-        /// (public) account so genesis and each authority's OCW agree without
-        /// key distribution — it is NOT secret. A production deployment would
-        /// use random per-node BLS keys registered via `register_bls_key`.
+        /// Deterministic per-authority BLS seed. Bootstrap-only: derived from
+        /// the (public) account so a fresh chain has BLS keys at genesis without
+        /// key distribution. NOT secret — each node overrides it on startup with
+        /// a random key via `ocw_ensure_bls_registered`.
         pub fn bls_seed(authority: &T::AccountId) -> [u8; 32] {
             sp_io::hashing::blake2_256(&(b"fastlane-bls-seed", authority).encode())
+        }
+
+        /// Canonical message an authority sr25519-signs to register a BLS key:
+        /// blake2_256(b"fastlane-bls-register" ++ public_key).
+        fn bls_register_message(public_key: &[u8]) -> [u8; 32] {
+            let mut msg = b"fastlane-bls-register".to_vec();
+            msg.extend_from_slice(public_key);
+            sp_io::hashing::blake2_256(&msg)
+        }
+
+        /// This node's persistent RANDOM BLS seed for `auth`, generated once and
+        /// kept in offchain-local storage. Never derived from public data, so
+        /// the resulting BLS secret is unforgeable (production-grade).
+        fn ocw_bls_seed(auth: &T::AccountId) -> [u8; 32] {
+            let mut skey = b"fastlane::bls-seed::".to_vec();
+            skey.extend_from_slice(&auth.encode());
+            let store = StorageValueRef::persistent(&skey);
+            if let Ok(Some(seed)) = store.get::<[u8; 32]>() {
+                return seed;
+            }
+            let random = sp_io::offchain::random_seed();
+            let seed = sp_io::hashing::blake2_256(
+                &(b"fastlane-bls-rand", auth, random).encode(),
+            );
+            store.set(&seed);
+            seed
+        }
+
+        /// Ensure this authority's RANDOM BLS public key is registered on-chain.
+        /// If it isn't (fresh node, or a bootstrap/account-derived key is still
+        /// in place), submit a self-authenticated unsigned registration proven
+        /// by an sr25519 signature from the authority's key.
+        fn ocw_ensure_bls_registered(
+            key_pub: &sp_core::sr25519::Public,
+            auth: &T::AccountId,
+        ) {
+            let seed = Self::ocw_bls_seed(auth);
+            let my_pub = Self::bls_public_from_seed(&seed);
+            if let Some(onchain) = AuthorityBlsKeys::<T>::get(auth) {
+                if onchain.as_slice() == my_pub.as_slice() {
+                    return;
+                }
+            }
+            let msg_hash = Self::bls_register_message(&my_pub);
+            if let Some(sig) = sp_io::crypto::sr25519_sign(
+                crate::crypto::KEY_TYPE,
+                key_pub,
+                &msg_hash,
+            ) {
+                let call = Call::register_bls_key_unsigned {
+                    authority_encoded: auth.encode(),
+                    public_key: my_pub,
+                    proof: sig.0.to_vec(),
+                };
+                let xt = T::create_inherent(call.into());
+                let _ = SubmitTransaction::<T, Call<T>>::submit_transaction(xt);
+            }
         }
 
         /// Shared BLS-attestation logic for `attest_bls` (signed) and

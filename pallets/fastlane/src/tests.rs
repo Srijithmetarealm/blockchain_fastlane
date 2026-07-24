@@ -987,3 +987,41 @@ fn bls_aggregated_event_fires_once_past_threshold() {
         assert!(crate::pallet::BlsAggregate::<Test>::get(pid).is_some());
     });
 }
+
+#[test]
+fn register_bls_key_unsigned_verifies_proof() {
+    use codec::Encode;
+    use sp_core::Pair;
+    three_auth_ext().execute_with(|| {
+        // A RANDOM BLS public key (arbitrary seed, not account-derived).
+        let pubkey = Fastlane::bls_public_from_seed(&[42u8; 32]);
+
+        // alice sr25519-signs the canonical registration message.
+        let mut m = b"fastlane-bls-register".to_vec();
+        m.extend_from_slice(&pubkey);
+        let msg_hash = sp_io::hashing::blake2_256(&m);
+        let sig = keypair("//Alice").sign(&msg_hash).0.to_vec();
+
+        assert_ok!(Fastlane::register_bls_key_unsigned(
+            RuntimeOrigin::none(),
+            alice().encode(),
+            pubkey.clone(),
+            sig
+        ));
+        assert_eq!(
+            crate::pallet::AuthorityBlsKeys::<Test>::get(&alice()).unwrap().into_inner(),
+            pubkey
+        );
+
+        // A bogus proof is rejected.
+        assert_noop!(
+            Fastlane::register_bls_key_unsigned(
+                RuntimeOrigin::none(),
+                bob().encode(),
+                Fastlane::bls_public_from_seed(&[43u8; 32]),
+                vec![0u8; 64]
+            ),
+            Error::<Test>::InvalidSignature
+        );
+    });
+}

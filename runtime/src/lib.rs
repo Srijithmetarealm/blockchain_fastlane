@@ -97,7 +97,12 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 106 -> 107: BlsAggregated event now fires once per payload (when the
 	// aggregate is first created) instead of once per attestation past the
 	// threshold. Behaviour-only; no storage change.
-	spec_version: 107,
+	// 107 -> 108: production BLS keys. Each node generates a RANDOM per-node BLS
+	// secret (offchain-local storage) and self-registers its public key via
+	// register_bls_key_unsigned (call 12), proven by an sr25519 signature — BLS
+	// keys are no longer derived from public accounts. Account-derived genesis
+	// keys remain only as a bootstrap that nodes override on startup.
+	spec_version: 108,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the
@@ -106,7 +111,8 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// `do_something_gated`), extending the transaction interface again.
 	// 3 -> 4: fastlane gained register_bls_key (9) and attest_bls (10).
 	// 4 -> 5: fastlane gained attest_bls_unsigned (11).
-	transaction_version: 5,
+	// 5 -> 6: fastlane gained register_bls_key_unsigned (12).
+	transaction_version: 6,
 	system_version: 1,
 };
 
