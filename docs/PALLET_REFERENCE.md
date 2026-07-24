@@ -7,8 +7,8 @@ instant UX confirmation, and is later made canonical by `Finalised`. It does
 **not** replace block consensus or finality — it sits in front of it.
 
 - Crate: [`pallets/fastlane`](../pallets/fastlane) · Source: [`src/lib.rs`](../pallets/fastlane/src/lib.rs)
-- Tests: 43 (`cargo test -p pallet-fastlane`) — 41 pallet + 2 BLS-aggregation proofs
-- Live: deployed at `spec_version 104` on the projectfreedom.io testnet.
+- Tests: 46 (`cargo test -p pallet-fastlane`) — 43 pallet + 3 BLS proofs
+- Live: deployed at `spec_version 105` on the projectfreedom.io testnet.
 
 ### Integration & Phase-2 status
 
@@ -16,11 +16,16 @@ instant UX confirmation, and is later made canonical by `Finalised`. It does
   consumes it via `type PreConsensusGate = Fastlane` and its `do_something_gated`
   extrinsic refuses to act unless the referenced payload is PreConsensed. Enforced
   on-chain as of `spec_version 104`.
-- **§14 signature aggregation (partial).** Two forms exist: the on-chain
-  `AggregatedAttestation` (bitmap + digest, storage reduction, live) and a proven
-  real-**BLS** aggregate over BLS12-381 (`bls_aggregation_tests.rs`, test-scoped:
-  5 sigs → one 48-byte aggregate). Wiring authorities to produce BLS signatures
-  on-chain (OCW keystore signing) is the remaining integration milestone.
+- **§14 real BLS aggregation (live).** BLS12-381 (TinyBLS381) aggregation runs
+  on-chain as of `spec_version 105`: `register_bls_key` records an authority's
+  BLS public key; `attest_bls` verifies each authority's BLS signature in-runtime
+  (no host function) and, at threshold, sums them into a single 48-byte
+  `BlsAggregate` — verified live (4 signatures → one 48-byte aggregate). The
+  in-runtime verifier `verify_bls_aggregate` compiles into the WASM, so this
+  deployed forklessly. The legacy bitmap `AggregatedAttestation` remains for the
+  sr25519 path. Remaining: wiring each authority's **offchain worker** to submit
+  `attest_bls` automatically (the crypto — `bls_sign_with_seed` — is done; the
+  demo drives it via `scripts/bls-live-demo.js` + the `bls_gen` example).
 
 ---
 

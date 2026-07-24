@@ -87,14 +87,19 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// extrinsic (`do_something_gated`) bound to `type PreConsensusGate =
 	// Fastlane`, making FastLane an enforced pre-consensus checkpoint for a
 	// downstream pallet. Additive, backward-compatible; no storage migration.
-	spec_version: 104,
+	// 104 -> 105: §14 real on-chain BLS. Adds register_bls_key (call 9) and
+	// attest_bls (call 10) plus AuthorityBlsKeys / BlsAttestations / BlsAggregate
+	// storage. Purely additive: new call indices and new (empty-by-default)
+	// storage, existing sr25519 attestation flow untouched. No migration.
+	spec_version: 105,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the
 	// Fastlane pallet's Call enum, changing the transaction interface.
 	// 2 -> 3: template pallet gained a new extrinsic (call index 2,
 	// `do_something_gated`), extending the transaction interface again.
-	transaction_version: 3,
+	// 3 -> 4: fastlane gained register_bls_key (9) and attest_bls (10).
+	transaction_version: 4,
 	system_version: 1,
 };
 
