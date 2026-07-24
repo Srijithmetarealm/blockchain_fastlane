@@ -17,6 +17,7 @@ pub trait WeightInfo {
     fn attest() -> Weight;
     fn attest_unsigned() -> Weight;
     fn finalize() -> Weight;
+    fn commit_inclusion() -> Weight;
     fn set_authorities(a: u32) -> Weight;
     fn set_threshold() -> Weight;
     fn post_bond() -> Weight;
@@ -55,6 +56,13 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
         Weight::from_parts(30_000_000, 0)
             .saturating_add(T::DbWeight::get().reads(2))
             .saturating_add(T::DbWeight::get().writes(2))
+    }
+
+    fn commit_inclusion() -> Weight {
+        // One sig verification plus a bounded read/write of the commitment list.
+        Weight::from_parts(30_000_000 + VERIFY_SIG, 0)
+            .saturating_add(T::DbWeight::get().reads(3))
+            .saturating_add(T::DbWeight::get().writes(1))
     }
 
     fn set_authorities(a: u32) -> Weight {
@@ -102,6 +110,7 @@ impl WeightInfo for () {
     fn attest() -> Weight { Weight::from_parts(110_000_000, 0) }
     fn attest_unsigned() -> Weight { Weight::from_parts(110_000_000, 0) }
     fn finalize() -> Weight { Weight::from_parts(30_000_000, 0) }
+    fn commit_inclusion() -> Weight { Weight::from_parts(90_000_000, 0) }
     fn set_authorities(_: u32) -> Weight { Weight::from_parts(50_000_000, 0) }
     fn set_threshold() -> Weight { Weight::from_parts(15_000_000, 0) }
     fn post_bond() -> Weight { Weight::from_parts(40_000_000, 0) }

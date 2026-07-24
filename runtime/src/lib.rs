@@ -72,10 +72,29 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	//   `spec_version`, and `authoring_version` are the same between Wasm and native.
 	// This value is set to 100 to notify Polkadot-JS App (https://polkadot.js.org/apps) to use
 	//   the compatible custom types.
-	spec_version: 100,
+	// Bumped 100 -> 101 for the forkless runtime upgrade that adds the §14
+	// features (commit_inclusion extrinsic, AggregatedAttestations /
+	// InclusionCommitments storage). A full node uses the on-chain Wasm runtime
+	// whenever this differs from its native version, so no validator restart is
+	// needed for the upgrade to take effect.
+	// 101 -> 102: deferred auto-finalisation (FinalizeDelay + FinalizeAt schedule)
+	// so PreConsensed payloads have a window for §14 inclusion commitments.
+	// 102 -> 103: FinalizeDelay 10 -> 2. The 10-block hold (~60s) outlived
+	// GRANDPA finality (~3 blocks) while no automatic producer of inclusion
+	// commitments existed, so it delayed the Finalised flag without adding
+	// safety. Storage layout is unchanged — only the schedule offset moves.
+	// 103 -> 104: §11 integration. The template pallet gains a FastLane-gated
+	// extrinsic (`do_something_gated`) bound to `type PreConsensusGate =
+	// Fastlane`, making FastLane an enforced pre-consensus checkpoint for a
+	// downstream pallet. Additive, backward-compatible; no storage migration.
+	spec_version: 104,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
-	transaction_version: 1,
+	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the
+	// Fastlane pallet's Call enum, changing the transaction interface.
+	// 2 -> 3: template pallet gained a new extrinsic (call index 2,
+	// `do_something_gated`), extending the transaction interface again.
+	transaction_version: 3,
 	system_version: 1,
 };
 

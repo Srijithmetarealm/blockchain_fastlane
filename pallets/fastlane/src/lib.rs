@@ -14,6 +14,8 @@ pub mod weights;
 mod mock;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod bls_aggregation_tests;
 
 
 #[frame_support::pallet]
@@ -139,11 +141,17 @@ pub mod pallet {
     }
 
     /// Downstream pallets use this trait as a gateway guard.
-    pub trait EnsurePreConsensed<T: Config> {
+    ///
+    /// Intentionally NOT generic over `Config`: a consumer pallet (e.g.
+    /// `pallet-template`) must be able to name this trait as a config bound
+    /// without knowing FastLane's concrete runtime `Config`. In the runtime,
+    /// `pallet_fastlane::Pallet<Runtime>` is the implementor, so a downstream
+    /// pallet sets `type PreConsensusGate = Fastlane;`.
+    pub trait EnsurePreConsensed {
         fn ensure_preconsensed(payload_id: PayloadId) -> DispatchResult;
     }
 
-    impl<T: Config> EnsurePreConsensed<T> for Pallet<T> {
+    impl<T: Config> EnsurePreConsensed for Pallet<T> {
         fn ensure_preconsensed(payload_id: PayloadId) -> DispatchResult {
             let status = Statuses::<T>::get(payload_id)
                 .ok_or(Error::<T>::PayloadNotFound)?;
@@ -193,6 +201,13 @@ pub mod pallet {
         type OffchainChecks: OffchainChecks<Self>;
         /// Maximum number of PreConsensed payloads auto-finalized in one block.
         type MaxAutoFinalizePerBlock: Get<u32>;
+        /// Number of blocks a payload stays PreConsensed before it is
+        /// auto-finalised. `0` schedules finalisation at the very next block
+        /// (effectively immediate); a larger value opens a window in which
+        /// authorities can post inclusion commitments (§14) before the payload
+        /// becomes canonical. Resolves the §6.3-vs-§14 tension: finalisation is
+        /// still automatic, just deferred by this many blocks.
+        type FinalizeDelay: Get<BlockNumberFor<Self>>;
         /// Maximum number of payloads expired in one block. Bounds the work
         /// performed in `on_initialize` so the chain cannot stall under load.
         type MaxExpiriesPerBlock: Get<u32>;
@@ -284,12 +299,53 @@ pub mod pallet {
         ValueQuery,
     >;
 
-    /// FIFO queue of payloads in PreConsensed state awaiting auto-finalisation.
-    /// Drained `MaxAutoFinalizePerBlock` items per block in `on_initialize`.
+    /// Legacy FIFO queue of PreConsensed payloads. Superseded by the block-
+    /// indexed `FinalizeAt` schedule (which supports a finalisation delay), but
+    /// retained so any entries present at a runtime upgrade are still drained by
+    /// `on_initialize`. New payloads are scheduled via `FinalizeAt`.
     #[pallet::storage]
     pub type PreConsensedQueue<T: Config> = StorageValue<
         _,
         BoundedVec<PayloadId, T::MaxPendingPayloads>,
+        ValueQuery,
+    >;
+
+    /// Per-block auto-finalisation schedule. When a payload reaches threshold at
+    /// block `b` it is scheduled at `b + FinalizeDelay`; `on_initialize` drains
+    /// `FinalizeAt[now]` (bounded by `MaxAutoFinalizePerBlock`, rescheduling any
+    /// overflow to the next block). The delay is the window during which
+    /// inclusion commitments (§14) can be posted against a PreConsensed payload.
+    #[pallet::storage]
+    pub type FinalizeAt<T: Config> = StorageMap<
+        _,
+        Twox64Concat,
+        BlockNumberFor<T>,
+        BoundedVec<PayloadId, T::MaxPendingPayloads>,
+        ValueQuery,
+    >;
+
+    /// Compact aggregate of the attestation set, written when a payload reaches
+    /// threshold. Survives finalisation (unlike `Attestations`, which is pruned)
+    /// so an explorer can always prove which authorities pre-consensed a payload.
+    #[pallet::storage]
+    #[pallet::getter(fn aggregated_attestation)]
+    pub type AggregatedAttestations<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        PayloadId,
+        AggregatedAttestation,
+        OptionQuery,
+    >;
+
+    /// Per-payload inclusion commitments — authorities' signed promises to
+    /// finalise a PreConsensed payload by a deadline block.
+    #[pallet::storage]
+    #[pallet::getter(fn inclusion_commitments)]
+    pub type InclusionCommitments<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        PayloadId,
+        BoundedVec<InclusionCommitment<T>, T::MaxAuthorities>,
         ValueQuery,
     >;
 
@@ -320,6 +376,15 @@ pub mod pallet {
         /// below `MinAuthorityBond` (typically after a slash). The chain may
         /// require governance intervention if the threshold is now unreachable.
         AuthorityEvicted { authority: T::AccountId },
+        /// Threshold reached — the per-authority signatures were collapsed into
+        /// a compact `AggregatedAttestation` (spec §14 storage reduction).
+        AttestationsAggregated { payload_id: PayloadId, count: u32 },
+        /// An authority committed to include a payload by `deadline`.
+        InclusionCommitted {
+            payload_id: PayloadId,
+            authority: T::AccountId,
+            deadline: BlockNumberFor<T>,
+        },
     }
 
     // --------------------------------------------------------
@@ -348,6 +413,12 @@ pub mod pallet {
         InsufficientBalance,
         SlashExceedsBond,
         MissingSlashProof,
+        /// Inclusion commitment requires the payload to be PreConsensed.
+        NotPreConsensed,
+        /// This authority already posted an inclusion commitment for the payload.
+        AlreadyCommitted,
+        /// Inclusion deadline must be strictly in the future.
+        InvalidDeadline,
     }
 
     // --------------------------------------------------------
@@ -389,6 +460,40 @@ pub mod pallet {
         pub checks_hash: [u8; 32],
     }
 
+    /// Compact, permanent record of the attestation set for a payload
+    /// (spec §14: "Signature aggregation to reduce storage").
+    ///
+    /// Built the moment the threshold is reached. Once a payload is finalised
+    /// the full per-authority `Attestations` list is pruned and only this
+    /// aggregate remains — reducing the long-term storage footprint of a
+    /// finalised payload from `count × (32 + 64 + 32)` bytes to a fixed
+    /// `8 + 32 + 4` bytes, while still proving *which* authorities signed
+    /// (`signer_bitmap`) and committing to the exact signatures (`digest`).
+    #[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+    pub struct AggregatedAttestation {
+        /// Bit `i` set ⇔ `Authorities[i]` contributed a signature. Supports up
+        /// to 64 authorities, comfortably above the runtime's MaxAuthorities.
+        pub signer_bitmap: u64,
+        /// blake2_256 over the concatenation of every contributing signature,
+        /// in authority order. A verifiable commitment to the aggregated set.
+        pub digest: [u8; 32],
+        /// Number of signatures aggregated (popcount of `signer_bitmap`).
+        pub count: u32,
+    }
+
+    /// An authority's signed promise to include/finalise a PreConsensed payload
+    /// by `deadline` (spec §14 "Inclusion commitment"). If the payload is not
+    /// Finalised by `deadline`, the authority is slashable via
+    /// `SlashProof::BrokenInclusion`.
+    #[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo)]
+    #[scale_info(skip_type_params(T))]
+    pub struct InclusionCommitment<T: Config> {
+        pub authority: T::AccountId,
+        pub committed_at: BlockNumberFor<T>,
+        pub deadline: BlockNumberFor<T>,
+        pub signature: Vec<u8>,
+    }
+
 
     // --------------------------------------------------------
     // Slash proof type
@@ -402,6 +507,9 @@ pub mod pallet {
         DoubleSigning(PayloadId, Vec<u8>, PayloadId, Vec<u8>),
         /// Authority submitted a signature that fails on-chain verification.
         InvalidSignature(PayloadId, Vec<u8>),
+        /// Authority committed to include `payload_id` but the deadline passed
+        /// with the payload still not finalised.
+        BrokenInclusion(PayloadId),
     }
 
     // --------------------------------------------------------
@@ -486,20 +594,60 @@ pub mod pallet {
                 });
             }
 
-            // Drain auto-finalisations from the PreConsensed queue.
+            // Drain auto-finalisations. Budget is shared across the legacy queue
+            // and the block-indexed schedule so per-block work stays bounded.
             let max_finalize = T::MaxAutoFinalizePerBlock::get() as usize;
             let mut finalized_count: u32 = 0;
+
+            // (a) Legacy PreConsensedQueue — drains any entries left over from
+            //     before the FinalizeAt schedule existed. Status-guarded so a
+            //     manually-finalised payload is not finalised twice.
             PreConsensedQueue::<T>::mutate(|queue| {
                 let take = max_finalize.min(queue.len());
                 for _ in 0..take {
                     let payload_id = queue.remove(0);
-                    if T::OnFinalised::on_finalised(payload_id).is_ok() {
+                    if matches!(Statuses::<T>::get(payload_id), Some(Status::PreConsensed))
+                        && T::OnFinalised::on_finalised(payload_id).is_ok()
+                    {
                         Statuses::<T>::insert(payload_id, Status::Finalised);
+                        Self::prune_finalised_storage(payload_id);
                         Self::deposit_event(Event::Finalised { payload_id });
                         finalized_count = finalized_count.saturating_add(1);
                     }
                 }
             });
+
+            // (b) Block-indexed FinalizeAt schedule for `now`. Overflow beyond
+            //     the remaining budget is rescheduled to the next block.
+            let scheduled_fin = FinalizeAt::<T>::take(now);
+            let mut fin_leftovers: Vec<PayloadId> = Vec::new();
+            for payload_id in scheduled_fin.into_iter() {
+                if (finalized_count as usize) >= max_finalize {
+                    fin_leftovers.push(payload_id);
+                    continue;
+                }
+                // Skip anything already finalised via manual finalize() — the
+                // status guard makes auto-finalisation idempotent, so finalize()
+                // needs no bookkeeping against this schedule.
+                if matches!(Statuses::<T>::get(payload_id), Some(Status::PreConsensed))
+                    && T::OnFinalised::on_finalised(payload_id).is_ok()
+                {
+                    Statuses::<T>::insert(payload_id, Status::Finalised);
+                    Self::prune_finalised_storage(payload_id);
+                    Self::deposit_event(Event::Finalised { payload_id });
+                    finalized_count = finalized_count.saturating_add(1);
+                }
+            }
+            if !fin_leftovers.is_empty() {
+                let next_block = now.saturating_add(1u32.into());
+                FinalizeAt::<T>::mutate(next_block, |q| {
+                    for id in fin_leftovers {
+                        if q.try_push(id).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
 
             T::WeightInfo::on_initialize_expire(expired_count)
                 .saturating_add(T::WeightInfo::on_initialize_finalize(finalized_count))
@@ -808,8 +956,11 @@ pub mod pallet {
             });
 
             Statuses::<T>::insert(payload_id, Status::Finalised);
-            Self::deposit_event(Event::Finalised { payload_id });
             T::OnFinalised::on_finalised(payload_id)?;
+            // §14: drop the full signature list + inclusion commitments; keep
+            // only the compact aggregate for the now-canonical payload.
+            Self::prune_finalised_storage(payload_id);
+            Self::deposit_event(Event::Finalised { payload_id });
 
             Ok(())
         }
@@ -965,6 +1116,65 @@ pub mod pallet {
 
             Ok(())
         }
+
+        // ----------------------------------------------------
+        // commit_inclusion — an authority signs a promise to include/finalise
+        // a PreConsensed payload by `deadline` (spec §14 inclusion commitment).
+        //
+        // Breaking the promise (deadline passes with the payload still not
+        // Finalised) is slashable via SlashProof::BrokenInclusion.
+        // ----------------------------------------------------
+        #[pallet::call_index(8)]
+        #[pallet::weight(T::WeightInfo::commit_inclusion())]
+        pub fn commit_inclusion(
+            origin: OriginFor<T>,
+            payload_id: PayloadId,
+            deadline: BlockNumberFor<T>,
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+
+            // Only registered authorities may commit.
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&who), Error::<T>::NotAuthority);
+
+            // Payload must currently be PreConsensed (fast-lane approved but not
+            // yet canonical) — that is the only window where a promise is useful.
+            let status = Statuses::<T>::get(payload_id)
+                .ok_or(Error::<T>::PayloadNotFound)?;
+            ensure!(status == Status::PreConsensed, Error::<T>::NotPreConsensed);
+
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(deadline > now, Error::<T>::InvalidDeadline);
+
+            // One commitment per authority per payload.
+            let mut commitments = InclusionCommitments::<T>::get(payload_id);
+            ensure!(
+                !commitments.iter().any(|c| c.authority == who),
+                Error::<T>::AlreadyCommitted
+            );
+
+            // Verify the signature over the canonical inclusion message.
+            let msg_hash = Self::inclusion_message_hash(&payload_id, &deadline);
+            Self::verify_authority_sig(&who, &msg_hash, &signature)?;
+
+            commitments
+                .try_push(InclusionCommitment::<T> {
+                    authority: who.clone(),
+                    committed_at: now,
+                    deadline,
+                    signature,
+                })
+                .map_err(|_| Error::<T>::AlreadyCommitted)?;
+            InclusionCommitments::<T>::insert(payload_id, commitments);
+
+            Self::deposit_event(Event::InclusionCommitted {
+                payload_id,
+                authority: who,
+                deadline,
+            });
+            Ok(())
+        }
     }
 
     // --------------------------------------------------------
@@ -1014,33 +1224,7 @@ pub mod pallet {
             msg.extend_from_slice(&checks_hash);
             let msg_hash: [u8; 32] = sp_io::hashing::blake2_256(&msg);
 
-            let raw_account: Vec<u8> = authority.encode();
-            ensure!(raw_account.len() == 32, Error::<T>::InvalidSignature);
-            let raw_arr: [u8; 32] = raw_account
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::<T>::InvalidSignature)?;
-            let pub_key = sp_core::sr25519::Public::from_raw(raw_arr);
-
-            let sig = if signature.len() == 64 {
-                let sig_bytes: [u8; 64] = signature
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::<T>::InvalidSignature)?;
-                sp_core::sr25519::Signature::from_raw(sig_bytes)
-            } else {
-                let multi = sp_runtime::MultiSignature::decode(&mut signature.as_slice())
-                    .map_err(|_| Error::<T>::InvalidSignature)?;
-                match multi {
-                    sp_runtime::MultiSignature::Sr25519(s) => s,
-                    _ => return Err(Error::<T>::InvalidSignature.into()),
-                }
-            };
-
-            ensure!(
-                sp_io::crypto::sr25519_verify(&sig, &msg_hash, &pub_key),
-                Error::<T>::InvalidSignature
-            );
+            Self::verify_authority_sig(&authority, &msg_hash, &signature)?;
             // -----------------------------------------------
 
             let record = SignatureRecord::<T> {
@@ -1055,15 +1239,110 @@ pub mod pallet {
             if threshold > 0 && sigs.len() as u32 >= threshold {
                 Statuses::<T>::insert(payload_id, Status::PreConsensed);
                 PendingCount::<T>::mutate(|c| *c = c.saturating_sub(1));
-                // Best-effort push; if the queue is full the payload still
-                // becomes PreConsensed and can be finalised manually via the
-                // finalize() extrinsic. The bound matches MaxPendingPayloads
-                // so this can only happen under simultaneous burst load.
-                let _ = PreConsensedQueue::<T>::mutate(|q| q.try_push(payload_id));
+                // Schedule auto-finalisation at `now + FinalizeDelay`. Best-
+                // effort push; if the bucket is full the payload still becomes
+                // PreConsensed and can be finalised manually via finalize().
+                let finalize_at = now.saturating_add(T::FinalizeDelay::get());
+                let _ = FinalizeAt::<T>::mutate(finalize_at, |q| q.try_push(payload_id));
+
+                // §14 storage reduction: collapse the per-authority signatures
+                // into a compact aggregate the moment the threshold is reached.
+                let aggregate = Self::build_aggregate(&sigs);
+                let count = aggregate.count;
+                AggregatedAttestations::<T>::insert(payload_id, aggregate);
+                Self::deposit_event(Event::AttestationsAggregated { payload_id, count });
+
                 Self::deposit_event(Event::PreConsensed { payload_id });
             }
 
             Ok(())
+        }
+
+        /// Verify an sr25519 signature by `authority` over `msg_hash`. Accepts
+        /// either a raw 64-byte signature or a SCALE-encoded `MultiSignature`.
+        /// Shared by `do_attest` and `commit_inclusion`.
+        fn verify_authority_sig(
+            authority: &T::AccountId,
+            msg_hash: &[u8; 32],
+            signature: &[u8],
+        ) -> DispatchResult {
+            let raw_account: Vec<u8> = authority.encode();
+            ensure!(raw_account.len() == 32, Error::<T>::InvalidSignature);
+            let raw_arr: [u8; 32] = raw_account
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidSignature)?;
+            let pub_key = sp_core::sr25519::Public::from_raw(raw_arr);
+
+            let sig = if signature.len() == 64 {
+                let sig_bytes: [u8; 64] = signature
+                    .try_into()
+                    .map_err(|_| Error::<T>::InvalidSignature)?;
+                sp_core::sr25519::Signature::from_raw(sig_bytes)
+            } else {
+                let multi = sp_runtime::MultiSignature::decode(&mut &signature[..])
+                    .map_err(|_| Error::<T>::InvalidSignature)?;
+                match multi {
+                    sp_runtime::MultiSignature::Sr25519(s) => s,
+                    _ => return Err(Error::<T>::InvalidSignature.into()),
+                }
+            };
+
+            ensure!(
+                sp_io::crypto::sr25519_verify(&sig, msg_hash, &pub_key),
+                Error::<T>::InvalidSignature
+            );
+            Ok(())
+        }
+
+        /// Canonical message hash an authority signs to commit to including a
+        /// payload: blake2_256(payload_id ++ b"INCLUDE" ++ deadline.encode()).
+        pub fn inclusion_message_hash(
+            payload_id: &PayloadId,
+            deadline: &BlockNumberFor<T>,
+        ) -> [u8; 32] {
+            let mut msg = payload_id.to_vec();
+            msg.extend_from_slice(b"INCLUDE");
+            msg.extend_from_slice(&deadline.encode());
+            sp_io::hashing::blake2_256(&msg)
+        }
+
+        /// Build the compact aggregate from a payload's signature set. The
+        /// bitmap indexes into the *current* authority ordering; the digest is a
+        /// commitment to the concatenated signatures in authority order.
+        fn build_aggregate(
+            sigs: &BoundedVec<SignatureRecord<T>, T::MaxAuthorities>,
+        ) -> AggregatedAttestation {
+            let authorities = Authorities::<T>::get();
+            let mut bitmap: u64 = 0;
+            let mut digest_input: Vec<u8> = Vec::new();
+            let mut count: u32 = 0;
+
+            for (idx, auth) in authorities.iter().enumerate() {
+                if idx >= 64 {
+                    break;
+                }
+                if let Some(record) = sigs.iter().find(|r| &r.authority == auth) {
+                    bitmap |= 1u64 << idx;
+                    digest_input.extend_from_slice(&record.signature);
+                    count = count.saturating_add(1);
+                }
+            }
+
+            AggregatedAttestation {
+                signer_bitmap: bitmap,
+                digest: sp_io::hashing::blake2_256(&digest_input),
+                count,
+            }
+        }
+
+        /// Remove the full per-authority attestation list and inclusion
+        /// commitments for a finalised payload. The compact
+        /// `AggregatedAttestations` record is retained. Reduces the permanent
+        /// storage footprint of finalised payloads (spec §14).
+        fn prune_finalised_storage(payload_id: PayloadId) {
+            Attestations::<T>::remove(payload_id);
+            InclusionCommitments::<T>::remove(payload_id);
         }
 
         /// Validates on-chain evidence before slashing.
@@ -1125,6 +1404,28 @@ pub mod pallet {
                         !sp_io::crypto::sr25519_verify(&sig, &msg_hash, &pub_key),
                         Error::<T>::MissingSlashProof
                     );
+
+                    Ok(())
+                }
+
+                SlashProof::BrokenInclusion(payload_id) => {
+                    // The authority must have an on-chain inclusion commitment
+                    // for this payload whose deadline has already passed.
+                    let commitments = InclusionCommitments::<T>::get(payload_id);
+                    let commitment = commitments
+                        .iter()
+                        .find(|c| &c.authority == authority)
+                        .ok_or(Error::<T>::MissingSlashProof)?;
+
+                    let now = frame_system::Pallet::<T>::block_number();
+                    ensure!(now > commitment.deadline, Error::<T>::MissingSlashProof);
+
+                    // The promise is only broken if the payload is NOT finalised.
+                    // (If InclusionCommitments were pruned on finalisation the
+                    // lookup above would already fail, but guard explicitly too.)
+                    let status = Statuses::<T>::get(payload_id)
+                        .ok_or(Error::<T>::PayloadNotFound)?;
+                    ensure!(status != Status::Finalised, Error::<T>::MissingSlashProof);
 
                     Ok(())
                 }

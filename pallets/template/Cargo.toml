@@ -17,6 +17,7 @@ codec = { features = ["derive"], workspace = true }
 frame-benchmarking = { optional = true, workspace = true }
 frame-support.workspace = true
 frame-system.workspace = true
+pallet-fastlane = { path = "../fastlane", default-features = false }
 scale-info = { features = ["derive"], workspace = true }
 
 [dev-dependencies]
@@ -31,6 +32,7 @@ std = [
 	"frame-benchmarking?/std",
 	"frame-support/std",
 	"frame-system/std",
+	"pallet-fastlane/std",
 	"scale-info/std",
 ]
 runtime-benchmarks = [

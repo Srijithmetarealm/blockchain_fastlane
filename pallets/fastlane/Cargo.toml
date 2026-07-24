@@ -17,6 +17,10 @@ log            = { version = "0.4", default-features = false }
 [dev-dependencies]
 sp-keyring = { workspace = true, default-features = true }
 pallet-balances = { workspace = true, default-features = true }
+# Real BLS (BLS12-381) for the §14 signature-aggregation proof. Test-only:
+# this does NOT enter the runtime/WASM build, so the live chain is unaffected.
+w3f-bls = { version = "0.1.9", default-features = true }
+rand = { version = "0.8", default-features = true }
 
 
 [features]

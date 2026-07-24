@@ -7,12 +7,13 @@
 
 use crate::{
     mock::{
-        account, checks_hash_for, keypair, payload_id_for, sign_attestation, AccountId,
-        Balance, BlockNumber, ExtBuilder, Fastlane, RuntimeOrigin, System, Test,
+        account, checks_hash_for, keypair, payload_id_for, sign_attestation, sign_inclusion,
+        AccountId, Balance, BlockNumber, ExtBuilder, Fastlane, RuntimeOrigin, System, Test,
     },
     pallet::{
-        AuthorityBonds, Authorities, Attestations, Error, Event, ExpiryAt, Nonces,
-        PendingCount, PreConsensedQueue, Status, Statuses, Threshold,
+        AggregatedAttestations, AuthorityBonds, Authorities, Attestations, Error, Event,
+        ExpiryAt, FinalizeAt, InclusionCommitments, Nonces, PendingCount,
+        SlashProof, Status, Statuses, Threshold,
     },
 };
 use frame_support::{
@@ -208,7 +209,8 @@ fn attest_reaches_threshold_and_preconsenses() {
 
         assert_eq!(Statuses::<Test>::get(pid), Some(Status::PreConsensed));
         assert_eq!(PendingCount::<Test>::get(), 0);
-        assert!(PreConsensedQueue::<Test>::get().contains(&pid));
+        // Scheduled for auto-finalisation at now + FinalizeDelay (=1 in mock).
+        assert!(FinalizeAt::<Test>::get(System::block_number() + 1).contains(&pid));
     });
 }
 
@@ -280,7 +282,12 @@ fn finalize_succeeds_when_preconsensed() {
         let pid = drive_to_preconsensed();
         assert_ok!(Fastlane::finalize(RuntimeOrigin::signed(dave()), pid));
         assert_eq!(Statuses::<Test>::get(pid), Some(Status::Finalised));
-        assert!(!PreConsensedQueue::<Test>::get().contains(&pid));
+
+        // Manual finalisation must be idempotent with the auto-finalise
+        // schedule: running on_initialize at the scheduled block is a no-op.
+        let scheduled = System::block_number() + 1;
+        Fastlane::on_initialize(scheduled);
+        assert_eq!(Statuses::<Test>::get(pid), Some(Status::Finalised));
     });
 }
 
@@ -299,13 +306,13 @@ fn finalize_rejected_when_only_submitted() {
 fn on_initialize_auto_finalizes_preconsensed() {
     three_auth_ext().execute_with(|| {
         let pid = drive_to_preconsensed();
-        assert!(PreConsensedQueue::<Test>::get().contains(&pid));
-
         let next = System::block_number() + 1;
+        assert!(FinalizeAt::<Test>::get(next).contains(&pid));
+
         Fastlane::on_initialize(next);
 
         assert_eq!(Statuses::<Test>::get(pid), Some(Status::Finalised));
-        assert!(!PreConsensedQueue::<Test>::get().contains(&pid));
+        assert!(!FinalizeAt::<Test>::get(next).contains(&pid));
     });
 }
 
@@ -331,15 +338,20 @@ fn on_initialize_finalize_is_bounded_per_block() {
             ));
             pids.push(pid);
         }
-        assert_eq!(PreConsensedQueue::<Test>::get().len(), 7);
+        // All 7 attested this block → scheduled at now + FinalizeDelay.
+        let sched = System::block_number() + 1;
+        assert_eq!(FinalizeAt::<Test>::get(sched).len(), 7);
 
-        // Run on_initialize once: 5 finalised, 2 remain.
-        Fastlane::on_initialize(System::block_number() + 1);
-        assert_eq!(PreConsensedQueue::<Test>::get().len(), 2);
+        // Run on_initialize at the scheduled block: 5 finalised, 2 rescheduled
+        // to the next block.
+        Fastlane::on_initialize(sched);
+        assert_eq!(FinalizeAt::<Test>::get(sched).len(), 0);
+        assert_eq!(FinalizeAt::<Test>::get(sched + 1).len(), 2);
 
-        // Run again: drains the rest.
-        Fastlane::on_initialize(System::block_number() + 2);
-        assert_eq!(PreConsensedQueue::<Test>::get().len(), 0);
+        // Next block drains the rest.
+        Fastlane::on_initialize(sched + 1);
+        assert_eq!(FinalizeAt::<Test>::get(sched + 1).len(), 0);
+        let _ = pids;
     });
 }
 
@@ -371,10 +383,13 @@ fn expired_payload_skipped_if_already_preconsensed() {
     three_auth_ext().execute_with(|| {
         // Submit and PreConsensed before expiry.
         let pid = drive_to_preconsensed();
-        // Block expiry+1 should NOT re-mark it as Expired.
+        // Auto-finalise at the scheduled block (now + FinalizeDelay).
+        let sched = System::block_number() + 1;
+        Fastlane::on_initialize(sched);
+        assert_eq!(Statuses::<Test>::get(pid), Some(Status::Finalised));
+        // Block expiry+1 must NOT re-mark it as Expired.
         System::set_block_number(101);
         Fastlane::on_initialize(101);
-        // Auto-finalised, not expired.
         assert_eq!(Statuses::<Test>::get(pid), Some(Status::Finalised));
     });
 }
@@ -600,5 +615,196 @@ fn validate_unsigned_rejects_unknown_payload() {
             TransactionSource::External, &call,
         );
         assert!(result.is_err());
+    });
+}
+
+// ============================================================
+// §14 — Signature aggregation (storage reduction)
+// ============================================================
+
+#[test]
+fn aggregate_written_when_threshold_reached() {
+    three_auth_ext().execute_with(|| {
+        let pid = drive_to_preconsensed();
+
+        let agg = AggregatedAttestations::<Test>::get(pid)
+            .expect("aggregate should exist after threshold");
+        // Authorities are [alice, bob, charlie]; alice(0) + bob(1) signed.
+        assert_eq!(agg.count, 2);
+        assert_eq!(agg.signer_bitmap, 0b011);
+        assert_ne!(agg.digest, [0u8; 32]);
+
+        // AttestationsAggregated event was emitted.
+        assert!(events().iter().any(|e| matches!(
+            e, Event::AttestationsAggregated { payload_id, count }
+                if *payload_id == pid && *count == 2
+        )));
+    });
+}
+
+#[test]
+fn finalize_prunes_signatures_but_keeps_aggregate() {
+    three_auth_ext().execute_with(|| {
+        let pid = drive_to_preconsensed();
+        // Full signature list is present pre-finalisation.
+        assert_eq!(Attestations::<Test>::get(pid).len(), 2);
+
+        assert_ok!(Fastlane::finalize(RuntimeOrigin::signed(dave()), pid));
+
+        assert_eq!(Statuses::<Test>::get(pid), Some(Status::Finalised));
+        // Individual signatures pruned; compact aggregate retained.
+        assert_eq!(Attestations::<Test>::get(pid).len(), 0);
+        let agg = AggregatedAttestations::<Test>::get(pid)
+            .expect("aggregate must survive finalisation");
+        assert_eq!(agg.count, 2);
+    });
+}
+
+// ============================================================
+// §14 — Inclusion commitments
+// ============================================================
+
+#[test]
+fn commit_inclusion_happy_path() {
+    three_auth_ext().execute_with(|| {
+        let pid = drive_to_preconsensed();
+        let deadline: BlockNumber = 50;
+        let alice_pair = keypair("//Alice");
+
+        assert_ok!(Fastlane::commit_inclusion(
+            RuntimeOrigin::signed(alice()),
+            pid,
+            deadline,
+            sign_inclusion(&alice_pair, pid, deadline),
+        ));
+
+        let commits = InclusionCommitments::<Test>::get(pid);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].authority, alice());
+        assert_eq!(commits[0].deadline, deadline);
+        assert!(matches!(last_event(),
+            Event::InclusionCommitted { payload_id, authority, deadline: d }
+                if payload_id == pid && authority == alice() && d == deadline));
+    });
+}
+
+#[test]
+fn commit_inclusion_rejects_non_authority() {
+    three_auth_ext().execute_with(|| {
+        let pid = drive_to_preconsensed();
+        let deadline: BlockNumber = 50;
+        let dave_pair = keypair("//Dave");
+        assert_noop!(
+            Fastlane::commit_inclusion(
+                RuntimeOrigin::signed(dave()), pid, deadline,
+                sign_inclusion(&dave_pair, pid, deadline),
+            ),
+            Error::<Test>::NotAuthority
+        );
+    });
+}
+
+#[test]
+fn commit_inclusion_rejects_when_only_submitted() {
+    three_auth_ext().execute_with(|| {
+        let (pid, _expiry, _ch) = submit_and_get_payload();
+        let deadline: BlockNumber = 50;
+        let alice_pair = keypair("//Alice");
+        assert_noop!(
+            Fastlane::commit_inclusion(
+                RuntimeOrigin::signed(alice()), pid, deadline,
+                sign_inclusion(&alice_pair, pid, deadline),
+            ),
+            Error::<Test>::NotPreConsensed
+        );
+    });
+}
+
+#[test]
+fn commit_inclusion_rejects_bad_signature() {
+    three_auth_ext().execute_with(|| {
+        let pid = drive_to_preconsensed();
+        let deadline: BlockNumber = 50;
+        assert_noop!(
+            Fastlane::commit_inclusion(
+                RuntimeOrigin::signed(alice()), pid, deadline, vec![0u8; 64],
+            ),
+            Error::<Test>::InvalidSignature
+        );
+    });
+}
+
+#[test]
+fn commit_inclusion_rejects_duplicate() {
+    three_auth_ext().execute_with(|| {
+        let pid = drive_to_preconsensed();
+        let deadline: BlockNumber = 50;
+        let alice_pair = keypair("//Alice");
+        let sig = sign_inclusion(&alice_pair, pid, deadline);
+        assert_ok!(Fastlane::commit_inclusion(
+            RuntimeOrigin::signed(alice()), pid, deadline, sig.clone(),
+        ));
+        assert_noop!(
+            Fastlane::commit_inclusion(RuntimeOrigin::signed(alice()), pid, deadline, sig),
+            Error::<Test>::AlreadyCommitted
+        );
+    });
+}
+
+#[test]
+fn commit_inclusion_rejects_past_deadline() {
+    three_auth_ext().execute_with(|| {
+        let pid = drive_to_preconsensed();
+        let alice_pair = keypair("//Alice");
+        // Deadline 0 is not > current block.
+        assert_noop!(
+            Fastlane::commit_inclusion(
+                RuntimeOrigin::signed(alice()), pid, 0,
+                sign_inclusion(&alice_pair, pid, 0),
+            ),
+            Error::<Test>::InvalidDeadline
+        );
+    });
+}
+
+#[test]
+fn slash_broken_inclusion_after_deadline() {
+    three_auth_ext().execute_with(|| {
+        assert_ok!(Fastlane::post_bond(RuntimeOrigin::signed(alice()), MIN_BOND * 5));
+        let pid = drive_to_preconsensed();
+        let deadline: BlockNumber = 5;
+        let alice_pair = keypair("//Alice");
+        assert_ok!(Fastlane::commit_inclusion(
+            RuntimeOrigin::signed(alice()), pid, deadline,
+            sign_inclusion(&alice_pair, pid, deadline),
+        ));
+
+        // Advance past the deadline; payload still not finalised.
+        System::set_block_number(deadline + 1);
+        let bond_before = AuthorityBonds::<Test>::get(&alice());
+        assert_ok!(Fastlane::slash(
+            RuntimeOrigin::root(), alice(), MIN_BOND, SlashProof::BrokenInclusion(pid),
+        ));
+        assert_eq!(AuthorityBonds::<Test>::get(&alice()), bond_before - MIN_BOND);
+    });
+}
+
+#[test]
+fn slash_broken_inclusion_rejected_before_deadline() {
+    three_auth_ext().execute_with(|| {
+        let pid = drive_to_preconsensed();
+        let deadline: BlockNumber = 50;
+        let alice_pair = keypair("//Alice");
+        assert_ok!(Fastlane::commit_inclusion(
+            RuntimeOrigin::signed(alice()), pid, deadline,
+            sign_inclusion(&alice_pair, pid, deadline),
+        ));
+        // Deadline not yet reached — slash proof invalid.
+        assert_noop!(
+            Fastlane::slash(
+                RuntimeOrigin::root(), alice(), MIN_BOND, SlashProof::BrokenInclusion(pid),
+            ),
+            Error::<Test>::MissingSlashProof
+        );
     });
 }

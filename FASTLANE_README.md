@@ -162,23 +162,36 @@ attest() = 50ms ref_time + call cost
 ```
 **Required for production:** Run `frame-benchmarking` on target hardware, generate weights.
 
-### 8. **Cannot Mix OCW Signatures with BLS Aggregation** (Phase 2)
-**Limitation:** Current implementation uses individual sr25519 signatures
-**Why:**
-- BLS aggregation requires different crypto
-- Would increase complexity significantly
-- Not in Phase 1 spec
-- Substrate's frame-system uses sr25519, not BLS
+### 8. **Signature Aggregation for Storage Reduction** (Phase 2 — implemented)
+**Approach:** Authorities still sign individually with sr25519 (the SDK exposes
+no host function for on-chain BLS aggregate verification at this polkadot-sdk
+version, so genuine BLS would mean running pairing crypto inside the wasm
+runtime). Instead the spec's stated *goal* — "reduce storage" — is met by
+collapsing the per-authority signatures into a compact `AggregatedAttestation`
+the moment the threshold is reached:
 
-**Current:**
-- Each authority signs individually
-- Signatures counted one by one
-- N authorities = N signatures on-chain
+```
+AggregatedAttestation {
+    signer_bitmap: u64,   // bit i set ⇔ Authorities[i] signed (≤ 64 authorities)
+    digest: [u8; 32],     // blake2_256 commitment to the concatenated signatures
+    count: u32,           // popcount(signer_bitmap)
+}
+```
 
-**Phase 2 (optional):**
-- BLS aggregation could reduce signature size
-- Requires custom crypto implementation
-- Not planned for current release
+- Written in `do_attest` at threshold; `AttestationsAggregated` event emitted.
+- On finalisation the full `Attestations` list is **pruned**
+  (`prune_finalised_storage`) and only this fixed-size aggregate remains — the
+  permanent footprint of a finalised payload drops from `count × 128` bytes to
+  `44` bytes, while still proving *which* authorities pre-consensed it.
+- A true BLS12-381 path remains available as a future swap if a host function
+  or acceptable in-wasm verifier lands.
+
+### 8b. **Inclusion Commitments** (Phase 2 — implemented)
+Authorities can post a signed promise to finalise a PreConsensed payload by a
+deadline block via `commit_inclusion(payload_id, deadline, signature)`. The
+promise is stored in `InclusionCommitments` and is slashable: if the deadline
+passes with the payload still not `Finalised`, governance can slash the
+authority with `SlashProof::BrokenInclusion(payload_id)`.
 
 ### 9. **Cannot Have Signatures Auto-Finalize Without Downstream Hook**
 **Limitation:** Payloads don't auto-finalize; they stay PreConsensed
@@ -376,7 +389,7 @@ pub const MAX_EXPIRIES_PER_BLOCK: u32 = 50;    // Bounded ops
 | Keys must be on disk, not in extension | Security isolation | Cannot use browser keys for OCW | Each validator needs separate machine |
 | Weights are placeholders | Require hardware benchmarking | May be inaccurate in production | Run `frame-benchmarking` before launch |
 | Uses Sudo for governance | Testing only | No decentralization | Replace with governance pallet |
-| No BLS aggregation | Phase 2 feature | Larger signature overhead | Implement BLS in Phase 2 |
+| Storage-reduction aggregation (bitmap + digest) instead of true BLS | No on-chain BLS host fn at this SDK version | Compact per-payload footprint; sr25519 retained | Swap to BLS12-381 if a host fn / in-wasm verifier lands |
 | Single-machine multi-key is insecure | Keys in one place | Not for production | Deploy on separate machines |
 | OCW requires node restart to add keys | Keys read at startup | Cannot hot-swap validators | Plan rotations ahead |
 | PreConsensed doesn't auto-finalize | Keeps pallet generic | Need downstream logic | Have app-specific pallet call finalize() |

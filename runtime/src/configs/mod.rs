@@ -41,9 +41,9 @@ use sp_version::RuntimeVersion;
 
 // Local module imports
 use super::{
-	AccountId, Aura, Balance, Balances, Block, BlockNumber, Hash, Nonce, PalletInfo, Runtime,
-	RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin, RuntimeTask,
-	System, EXISTENTIAL_DEPOSIT, SLOT_DURATION, VERSION,
+	AccountId, Aura, Balance, Balances, Block, BlockNumber, Fastlane, Hash, Nonce, PalletInfo,
+	Runtime, RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin,
+	RuntimeTask, System, EXISTENTIAL_DEPOSIT, SLOT_DURATION, VERSION,
 };
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
@@ -169,6 +169,9 @@ impl pallet_sudo::Config for Runtime {
 impl pallet_template::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type WeightInfo = pallet_template::weights::SubstrateWeight<Runtime>;
+	// FastLane is the mandatory pre-consensus checkpoint for the template
+	// pallet's gated dispatchables (spec §11).
+	type PreConsensusGate = Fastlane;
 }
 impl pallet_fastlane::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
@@ -185,6 +188,17 @@ impl pallet_fastlane::Config for Runtime {
     type AllowedDomains = AllowedDomains;
     type OffchainChecks = ();
     type MaxAutoFinalizePerBlock = MaxAutoFinalizePerBlock;
+    // Payloads stay PreConsensed for ~2 blocks (~12s at 6s/block) before
+    // auto-finalising — the window in which authorities can post inclusion
+    // commitments (§14). Finalisation is still automatic, just deferred.
+    //
+    // Kept below the ~3-block GRANDPA finality lag on purpose: the block
+    // carrying the PreConsensed event is canonically final at ~18s, so a
+    // longer pallet-level hold made this flag the slowest clock in the system
+    // without buying anything. Nothing posts commitments automatically yet
+    // (the OCW submits attest_unsigned only), so the window only needs to be
+    // wide enough for a manual commit_inclusion, not for an unused Phase-2 path.
+    type FinalizeDelay = ConstU32<2>;
     type MaxExpiriesPerBlock = MaxExpiriesPerBlock;
     type WeightInfo = pallet_fastlane::weights::SubstrateWeight<Runtime>;
 
