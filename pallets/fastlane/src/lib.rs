@@ -16,6 +16,8 @@ mod mock;
 mod tests;
 #[cfg(test)]
 mod bls_aggregation_tests;
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
 
 
 #[frame_support::pallet]
@@ -1381,7 +1383,7 @@ pub mod pallet {
         // register_bls_key — an authority registers its BLS public key (§14).
         // ----------------------------------------------------
         #[pallet::call_index(9)]
-        #[pallet::weight(T::WeightInfo::attest())]
+        #[pallet::weight(T::WeightInfo::register_bls_key())]
         pub fn register_bls_key(
             origin: OriginFor<T>,
             public_key: Vec<u8>,
@@ -1414,7 +1416,7 @@ pub mod pallet {
         // reduction, verifiable against the committee's public keys.
         // ----------------------------------------------------
         #[pallet::call_index(10)]
-        #[pallet::weight(T::WeightInfo::attest())]
+        #[pallet::weight(T::WeightInfo::attest_bls())]
         pub fn attest_bls(
             origin: OriginFor<T>,
             payload_id: PayloadId,
@@ -1431,7 +1433,7 @@ pub mod pallet {
         // registered key), so no outer sr25519 signature is needed.
         // ----------------------------------------------------
         #[pallet::call_index(11)]
-        #[pallet::weight(T::WeightInfo::attest_unsigned())]
+        #[pallet::weight(T::WeightInfo::attest_bls())]
         pub fn attest_bls_unsigned(
             origin: OriginFor<T>,
             payload_id: PayloadId,
@@ -1451,7 +1453,7 @@ pub mod pallet {
         // registered key cannot be forged from public data.
         // ----------------------------------------------------
         #[pallet::call_index(12)]
-        #[pallet::weight(T::WeightInfo::attest_unsigned())]
+        #[pallet::weight(T::WeightInfo::register_bls_key_unsigned())]
         pub fn register_bls_key_unsigned(
             origin: OriginFor<T>,
             authority_encoded: Vec<u8>,

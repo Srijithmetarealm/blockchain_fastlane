@@ -102,7 +102,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// register_bls_key_unsigned (call 12), proven by an sr25519 signature — BLS
 	// keys are no longer derived from public accounts. Account-derived genesis
 	// keys remain only as a bootstrap that nodes override on startup.
-	spec_version: 108,
+	// 108 -> 109: dedicated (conservative) weights for the BLS extrinsics — an
+	// in-runtime BLS pairing verify is ~100x an sr25519 verify, so the previous
+	// reuse of attest() weight under-priced them (DoS risk). Weights-only.
+	spec_version: 109,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the
