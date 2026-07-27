@@ -871,14 +871,15 @@ fn attest_bls_rejects_unregistered_and_bad_signature() {
         submit_payload(dave(), 0, 100, 1, [7u8; 32]);
         let pid = payload_id_for(dave(), 0, 1, [7u8; 32]);
 
-        // Remove alice's genesis BLS key → unregistered path is rejected.
-        crate::pallet::AuthorityBlsKeys::<Test>::remove(&alice());
+        // No BLS key registered (keys are not set at genesis) → rejected.
         assert_noop!(
             Fastlane::attest_bls(RuntimeOrigin::signed(alice()), pid, vec![0u8; 48]),
             Error::<Test>::BlsKeyNotRegistered
         );
 
-        // With a genesis key in place (bob), a bogus signature is rejected.
+        // With a key registered, a bogus signature is rejected.
+        let pk = Fastlane::bls_public_from_seed(&Fastlane::bls_seed(&bob()));
+        assert_ok!(Fastlane::register_bls_key(RuntimeOrigin::signed(bob()), pk));
         assert_noop!(
             Fastlane::attest_bls(RuntimeOrigin::signed(bob()), pid, vec![7u8; 48]),
             Error::<Test>::InvalidBlsSignature
@@ -886,23 +887,21 @@ fn attest_bls_rejects_unregistered_and_bad_signature() {
     });
 }
 
-#[test]
-fn genesis_populates_bls_keys() {
-    three_auth_ext().execute_with(|| {
-        for a in [alice(), bob(), charlie()] {
-            let stored = crate::pallet::AuthorityBlsKeys::<Test>::get(&a)
-                .expect("genesis BLS key present")
-                .into_inner();
-            let expected = Fastlane::bls_public_from_seed(&Fastlane::bls_seed(&a));
-            assert_eq!(stored, expected, "genesis key must match deterministic seed");
-        }
-    });
+/// Register the `bls_seed`-derived key for each authority. Genesis no longer
+/// registers keys — production nodes self-register their random key — so tests
+/// that exercise the BLS path register explicitly here.
+fn register_bls_keys(auths: &[AccountId]) {
+    for a in auths {
+        let pk = Fastlane::bls_public_from_seed(&Fastlane::bls_seed(a));
+        assert_ok!(Fastlane::register_bls_key(RuntimeOrigin::signed(a.clone()), pk));
+    }
 }
 
 #[test]
 fn attest_bls_unsigned_aggregates_from_ocw() {
     use codec::Encode;
     three_auth_ext().execute_with(|| {
+        register_bls_keys(&[alice(), bob()]);
         submit_payload(dave(), 0, 100, 1, [7u8; 32]);
         let pid = payload_id_for(dave(), 0, 1, [7u8; 32]);
 
@@ -937,32 +936,10 @@ fn attest_bls_unsigned_aggregates_from_ocw() {
 }
 
 #[test]
-fn set_authorities_auto_registers_bls_keys() {
-    three_auth_ext().execute_with(|| {
-        // dave is not a genesis authority, so he has no BLS key yet.
-        assert!(crate::pallet::AuthorityBlsKeys::<Test>::get(&dave()).is_none());
-
-        // Bond dave, then add him to the authority set via governance.
-        assert_ok!(Fastlane::post_bond(RuntimeOrigin::signed(dave()), MIN_BOND));
-        assert_ok!(Fastlane::set_authorities(
-            RuntimeOrigin::root(),
-            frame_support::BoundedVec::try_from(vec![alice(), bob(), charlie(), dave()]).unwrap()
-        ));
-
-        // dave now has an auto-registered BLS key matching his deterministic seed.
-        let stored = crate::pallet::AuthorityBlsKeys::<Test>::get(&dave())
-            .expect("set_authorities must auto-register a BLS key")
-            .into_inner();
-        assert_eq!(stored, Fastlane::bls_public_from_seed(&Fastlane::bls_seed(&dave())));
-    });
-}
-
-#[test]
 fn bls_aggregated_event_fires_once_past_threshold() {
     use codec::Encode;
     three_auth_ext().execute_with(|| {
-        // alice/bob/charlie are genesis authorities (BLS keys auto-registered),
-        // threshold is 2.
+        register_bls_keys(&[alice(), bob(), charlie()]);
         submit_payload(dave(), 0, 100, 1, [7u8; 32]);
         let pid = payload_id_for(dave(), 0, 1, [7u8; 32]);
 
@@ -1023,5 +1000,35 @@ fn register_bls_key_unsigned_verifies_proof() {
             ),
             Error::<Test>::InvalidSignature
         );
+    });
+}
+
+#[test]
+fn submit_rejects_unverified_kyc() {
+    three_auth_ext().execute_with(|| {
+        // MockKyc rejects //Banned.
+        let banned = account("//Banned");
+        assert_noop!(
+            Fastlane::submit(RuntimeOrigin::signed(banned), 0, 100, 1, [7u8; 32]),
+            Error::<Test>::NotKycVerified
+        );
+    });
+}
+
+#[test]
+fn submit_enforces_rate_limit() {
+    three_auth_ext().execute_with(|| {
+        crate::mock::MockSubmitCooldown::set(&10);
+        // First submission at genesis block (1).
+        submit_payload(dave(), 0, 100, 1, [7u8; 32]);
+        // A second submission in the same block is rate-limited (checked before
+        // the nonce check).
+        assert_noop!(
+            Fastlane::submit(RuntimeOrigin::signed(dave()), 1, 100, 1, [8u8; 32]),
+            Error::<Test>::SubmitTooFrequent
+        );
+        // After the cooldown elapses, it's allowed again.
+        System::set_block_number(11);
+        assert_ok!(Fastlane::submit(RuntimeOrigin::signed(dave()), 1, 100, 1, [8u8; 32]));
     });
 }

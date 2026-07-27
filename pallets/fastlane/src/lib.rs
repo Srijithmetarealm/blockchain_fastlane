@@ -165,6 +165,18 @@ pub mod pallet {
         }
     }
 
+    /// Pluggable KYC gate for payload creators (spec §7). The runtime supplies
+    /// real KYC logic; the default `()` implementation approves everyone, which
+    /// is appropriate for a permissionless testnet. Enforced in `submit`.
+    pub trait KycProvider<AccountId> {
+        fn is_verified(who: &AccountId) -> bool;
+    }
+    impl<AccountId> KycProvider<AccountId> for () {
+        fn is_verified(_who: &AccountId) -> bool {
+            true
+        }
+    }
+
     // --------------------------------------------------------
     // Pallet configuration trait
     // --------------------------------------------------------
@@ -213,6 +225,12 @@ pub mod pallet {
         /// Maximum number of payloads expired in one block. Bounds the work
         /// performed in `on_initialize` so the chain cannot stall under load.
         type MaxExpiriesPerBlock: Get<u32>;
+        /// Pluggable KYC provider for payload creators (spec §7). Default `()`
+        /// approves everyone.
+        type KycProvider: KycProvider<Self::AccountId>;
+        /// Minimum number of blocks between submissions from the same creator
+        /// (per-creator rate limit, spec §7). `0` disables it.
+        type SubmitCooldown: Get<BlockNumberFor<Self>>;
         /// Benchmarked weights.
         type WeightInfo: crate::weights::WeightInfo;
     }
@@ -288,6 +306,17 @@ pub mod pallet {
     #[pallet::storage]
     #[pallet::getter(fn pending_count)]
     pub type PendingCount<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+    /// Last block at which each creator submitted — enforces the per-creator
+    /// submission cooldown (rate limiting, spec §7).
+    #[pallet::storage]
+    pub type LastSubmitAt<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        BlockNumberFor<T>,
+        OptionQuery,
+    >;
 
     /// Per-block expiry index. When the chain reaches block `expiry + 1`,
     /// `on_initialize` drains `ExpiryAt[expiry + 1]` and marks any still-
@@ -476,6 +505,10 @@ pub mod pallet {
         InvalidBlsSignature,
         /// This authority already submitted a BLS attestation for the payload.
         BlsAlreadyAttested,
+        /// The creator is not KYC-verified (spec §7).
+        NotKycVerified,
+        /// The creator submitted too recently — per-creator rate limit (§7).
+        SubmitTooFrequent,
     }
 
     // --------------------------------------------------------
@@ -602,18 +635,13 @@ pub mod pallet {
                 }
             }
 
-            // §14: populate each authority's BLS public key from its
-            // deterministic seed so offchain workers can BLS-sign attestations
-            // from genesis (no manual register_bls_key needed on a fresh chain).
-            for authority in &self.authorities {
-                let seed = Pallet::<T>::bls_seed(authority);
-                let pubkey = Pallet::<T>::bls_public_from_seed(&seed);
-                if let Ok(bounded) =
-                    TryInto::<BoundedVec<u8, ConstU32<128>>>::try_into(pubkey)
-                {
-                    AuthorityBlsKeys::<T>::insert(authority, bounded);
-                }
-            }
+            // §14: BLS keys are NOT populated at genesis. Each authority's node
+            // generates a random secret and self-registers its public key on
+            // startup (ocw_ensure_bls_registered → register_bls_key_unsigned),
+            // so no guessable, account-derived key is ever active on-chain.
+            // BLS aggregation therefore begins a few blocks after genesis, once
+            // nodes have registered — a deliberate security-over-convenience
+            // trade-off.
 
             Authorities::<T>::put(bounded);
             Threshold::<T>::put(self.threshold);
@@ -1044,6 +1072,23 @@ pub mod pallet {
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(expiry > now, Error::<T>::PayloadExpired);
 
+            // §7: KYC gate for the creator (pluggable; default approves all).
+            ensure!(
+                T::KycProvider::is_verified(&who),
+                Error::<T>::NotKycVerified
+            );
+
+            // §7: per-creator submission rate limit.
+            let cooldown = T::SubmitCooldown::get();
+            if !cooldown.is_zero() {
+                if let Some(last) = LastSubmitAt::<T>::get(&who) {
+                    ensure!(
+                        now >= last.saturating_add(cooldown),
+                        Error::<T>::SubmitTooFrequent
+                    );
+                }
+            }
+
             let expected_nonce = Nonces::<T>::get(&who);
             ensure!(nonce == expected_nonce, Error::<T>::InvalidNonce);
 
@@ -1091,6 +1136,7 @@ pub mod pallet {
             Payloads::<T>::insert(payload_id, payload);
             Statuses::<T>::insert(payload_id, Status::Submitted);
             Nonces::<T>::insert(&who, nonce.saturating_add(1));
+            LastSubmitAt::<T>::insert(&who, now);
             PendingCount::<T>::mutate(|c| *c = c.saturating_add(1));
 
             Self::deposit_event(Event::Submitted { payload_id, creator: who });
@@ -1168,21 +1214,9 @@ pub mod pallet {
                 ensure!(bonded >= T::MinAuthorityBond::get(), Error::<T>::BondTooLow);
             }
 
-            // §14: auto-register a BLS key for any new authority that lacks one,
-            // mirroring genesis. Ensures BLS attestation works immediately after
-            // an authority-set change — no manual register_bls_key needed.
-            // Existing registrations are left untouched.
-            for auth in new_authorities.iter() {
-                if !AuthorityBlsKeys::<T>::contains_key(auth) {
-                    let seed = Self::bls_seed(auth);
-                    let pubkey = Self::bls_public_from_seed(&seed);
-                    if let Ok(bounded) =
-                        TryInto::<BoundedVec<u8, ConstU32<128>>>::try_into(pubkey)
-                    {
-                        AuthorityBlsKeys::<T>::insert(auth, bounded);
-                    }
-                }
-            }
+            // §14: BLS keys are not auto-registered here. A newly-added
+            // authority's node self-registers its random key on startup
+            // (register_bls_key_unsigned), so no account-derived key is used.
 
             let count = new_authorities.len() as u32;
             Authorities::<T>::put(new_authorities);

@@ -53,6 +53,16 @@ impl pallet_balances::Config for Test {
 
 parameter_types! {
     pub AllowedDomains: Vec<u32> = Vec::new();
+    // Settable per-test so rate-limit tests can enable it; 0 elsewhere.
+    pub storage MockSubmitCooldown: BlockNumber = 0;
+}
+
+/// Test KYC provider: everyone is verified except `//Banned`.
+pub struct MockKyc;
+impl pallet_fastlane::KycProvider<AccountId> for MockKyc {
+    fn is_verified(who: &AccountId) -> bool {
+        *who != account("//Banned")
+    }
 }
 
 impl SigningTypes for Test {
@@ -94,6 +104,8 @@ impl pallet_fastlane::Config for Test {
     type MaxAutoFinalizePerBlock = ConstU32<5>;
     type FinalizeDelay = ConstU64<1>;
     type MaxExpiriesPerBlock = ConstU32<5>;
+    type KycProvider = MockKyc;
+    type SubmitCooldown = MockSubmitCooldown;
     type WeightInfo = ();
     type OnFinalised = ();
 }

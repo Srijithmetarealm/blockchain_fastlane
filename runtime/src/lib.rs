@@ -108,7 +108,11 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 109 -> 110: replace conservative BLS weights with BENCHMARKED values
 	// (register_bls_key ~4.3ms, attest_bls ~49.5ms). The 6ms estimate was itself
 	// 8x too low — benchmarks matter. Weights-only.
-	spec_version: 110,
+	// 110 -> 111: production hardening. §7 real checks — a pluggable KycProvider
+	// gate and a per-creator SubmitCooldown rate limit in submit() (both no-op
+	// by config on this testnet). §14 bootstrap-key window closed — BLS keys are
+	// no longer set at genesis/set_authorities; nodes self-register random keys.
+	spec_version: 111,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the

@@ -200,6 +200,11 @@ impl pallet_fastlane::Config for Runtime {
     // wide enough for a manual commit_inclusion, not for an unused Phase-2 path.
     type FinalizeDelay = ConstU32<2>;
     type MaxExpiriesPerBlock = MaxExpiriesPerBlock;
+    // §7: permissionless testnet — all creators pass KYC. A production runtime
+    // supplies a real KycProvider here. SubmitCooldown 0 = rate limit disabled;
+    // set a non-zero block count to throttle per-creator submissions.
+    type KycProvider = ();
+    type SubmitCooldown = ConstU32<0>;
     type WeightInfo = pallet_fastlane::weights::SubstrateWeight<Runtime>;
 
     type OnFinalised = ();
