@@ -105,7 +105,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 108 -> 109: dedicated (conservative) weights for the BLS extrinsics — an
 	// in-runtime BLS pairing verify is ~100x an sr25519 verify, so the previous
 	// reuse of attest() weight under-priced them (DoS risk). Weights-only.
-	spec_version: 109,
+	// 109 -> 110: replace conservative BLS weights with BENCHMARKED values
+	// (register_bls_key ~4.3ms, attest_bls ~49.5ms). The 6ms estimate was itself
+	// 8x too low — benchmarks matter. Weights-only.
+	spec_version: 110,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the

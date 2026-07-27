@@ -38,10 +38,6 @@ pub trait WeightInfo {
 const READ: u64 = 25_000_000;
 const WRITE: u64 = 100_000_000;
 const VERIFY_SIG: u64 = 60_000_000;
-// One in-runtime BLS12-381 pairing verify. Conservative upper bound (~6ms) —
-// ~100x an sr25519 verify — until formal benchmarks replace it. Deliberately
-// generous so BLS calls cannot be under-priced (the DoS concern).
-const BLS_VERIFY: u64 = 6_000_000_000;
 
 pub struct SubstrateWeight<T>(core::marker::PhantomData<T>);
 
@@ -114,24 +110,26 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
             .saturating_add(T::DbWeight::get().writes(p as u64))
     }
 
+    // Benchmarked on this host (`benchmark pallet`, 20 steps / 10 repeat).
+    // A BLS12-381 verify runs in-runtime, so these are large — ~4.3ms to
+    // validate a key, ~49.5ms for a signature verify + aggregate.
     fn register_bls_key() -> Weight {
-        // Validate the pubkey (one BLS deserialisation) + write.
-        Weight::from_parts(BLS_VERIFY / 4, 0)
+        // Measured: validate the BLS public key (one deserialisation) + write.
+        Weight::from_parts(4_255_593_000, 1709)
             .saturating_add(T::DbWeight::get().reads(2))
             .saturating_add(T::DbWeight::get().writes(1))
     }
 
     fn attest_bls() -> Weight {
-        // One BLS verify of the authority's signature, plus at threshold an
-        // aggregation over the collected signatures.
-        Weight::from_parts(BLS_VERIFY.saturating_add(50_000_000), 0)
+        // Measured: one BLS signature verify + aggregation over the set.
+        Weight::from_parts(49_548_235_000, 4021)
             .saturating_add(T::DbWeight::get().reads(5))
             .saturating_add(T::DbWeight::get().writes(2))
     }
 
     fn register_bls_key_unsigned() -> Weight {
-        // sr25519 proof verify + BLS pubkey validation + write.
-        Weight::from_parts(VERIFY_SIG.saturating_add(BLS_VERIFY / 4), 0)
+        // BLS pubkey validation (measured) + an sr25519 proof verify.
+        Weight::from_parts(4_255_593_000u64.saturating_add(VERIFY_SIG), 1709)
             .saturating_add(T::DbWeight::get().reads(2))
             .saturating_add(T::DbWeight::get().writes(1))
     }
@@ -149,7 +147,7 @@ impl WeightInfo for () {
     fn slash() -> Weight { Weight::from_parts(110_000_000, 0) }
     fn on_initialize_expire(_: u32) -> Weight { Weight::from_parts(10_000_000, 0) }
     fn on_initialize_finalize(_: u32) -> Weight { Weight::from_parts(10_000_000, 0) }
-    fn register_bls_key() -> Weight { Weight::from_parts(1_500_000_000, 0) }
-    fn attest_bls() -> Weight { Weight::from_parts(6_000_000_000, 0) }
-    fn register_bls_key_unsigned() -> Weight { Weight::from_parts(1_560_000_000, 0) }
+    fn register_bls_key() -> Weight { Weight::from_parts(4_255_593_000, 0) }
+    fn attest_bls() -> Weight { Weight::from_parts(49_548_235_000, 0) }
+    fn register_bls_key_unsigned() -> Weight { Weight::from_parts(4_315_593_000, 0) }
 }
