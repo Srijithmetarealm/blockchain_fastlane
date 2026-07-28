@@ -112,7 +112,11 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// gate and a per-creator SubmitCooldown rate limit in submit() (both no-op
 	// by config on this testnet). §14 bootstrap-key window closed — BLS keys are
 	// no longer set at genesis/set_authorities; nodes self-register random keys.
-	spec_version: 111,
+	// 111 -> 112: §7 domain-specific rules are now a pluggable DomainRules hook
+	// (default allow-all) evaluated in the OCW's compute_checks_hash — the last
+	// hardcoded `true` check is gone. Output-equivalent under the default
+	// providers, so checks_hash is unchanged on this testnet.
+	spec_version: 112,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the

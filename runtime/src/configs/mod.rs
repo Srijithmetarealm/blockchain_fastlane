@@ -204,6 +204,7 @@ impl pallet_fastlane::Config for Runtime {
     // supplies a real KycProvider here. SubmitCooldown 0 = rate limit disabled;
     // set a non-zero block count to throttle per-creator submissions.
     type KycProvider = ();
+    type DomainRules = ();
     type SubmitCooldown = ConstU32<0>;
     type WeightInfo = pallet_fastlane::weights::SubstrateWeight<Runtime>;
 

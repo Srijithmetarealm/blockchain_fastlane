@@ -65,6 +65,14 @@ impl pallet_fastlane::KycProvider<AccountId> for MockKyc {
     }
 }
 
+/// Test domain rules: every domain is allowed except 99.
+pub struct MockDomainRules;
+impl pallet_fastlane::DomainRules<AccountId> for MockDomainRules {
+    fn is_allowed(_creator: &AccountId, domain: u32, _payload_hash: &[u8; 32]) -> bool {
+        domain != 99
+    }
+}
+
 impl SigningTypes for Test {
     type Public = <Signature as Verify>::Signer;
     type Signature = Signature;
@@ -105,6 +113,7 @@ impl pallet_fastlane::Config for Test {
     type FinalizeDelay = ConstU64<1>;
     type MaxExpiriesPerBlock = ConstU32<5>;
     type KycProvider = MockKyc;
+    type DomainRules = MockDomainRules;
     type SubmitCooldown = MockSubmitCooldown;
     type WeightInfo = ();
     type OnFinalised = ();

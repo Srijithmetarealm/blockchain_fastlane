@@ -1032,3 +1032,23 @@ fn submit_enforces_rate_limit() {
         assert_ok!(Fastlane::submit(RuntimeOrigin::signed(dave()), 1, 100, 1, [8u8; 32]));
     });
 }
+
+#[test]
+fn domain_rules_reject_disallowed_domain() {
+    use crate::pallet::OffchainChecks;
+    three_auth_ext().execute_with(|| {
+        // AllowedDomains is empty, so domain 99 is accepted at submit()...
+        submit_payload(dave(), 0, 100, 99, [7u8; 32]);
+        let pid = payload_id_for(dave(), 0, 99, [7u8; 32]);
+        let payload = crate::pallet::Payloads::<Test>::get(pid).unwrap();
+        // ...but MockDomainRules rejects domain 99, so the OCW produces no
+        // checks_hash and never attests it.
+        assert!(<() as OffchainChecks<Test>>::compute_checks_hash(&payload).is_none());
+
+        // A normal domain passes the per-domain rules.
+        submit_payload(dave(), 1, 100, 1, [8u8; 32]);
+        let pid2 = payload_id_for(dave(), 1, 1, [8u8; 32]);
+        let payload2 = crate::pallet::Payloads::<Test>::get(pid2).unwrap();
+        assert!(<() as OffchainChecks<Test>>::compute_checks_hash(&payload2).is_some());
+    });
+}

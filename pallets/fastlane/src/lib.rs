@@ -109,9 +109,16 @@ pub mod pallet {
             let nonce_ok =
                 Nonces::<T>::get(&payload.creator) >= payload.nonce.saturating_add(1);
             let balance_ok = !T::Currency::free_balance(&payload.creator).is_zero();
-            let kyc_ok = true;
+            // KYC re-checked here (also enforced at submit) for defense in depth.
+            let kyc_ok = T::KycProvider::is_verified(&payload.creator);
+            // Rate limit is stateful and already enforced at submit().
             let rate_limit_ok = true;
-            let domain_specific_ok = true;
+            // §7: real, pluggable per-domain business rules (default: allow all).
+            let domain_specific_ok = T::DomainRules::is_allowed(
+                &payload.creator,
+                payload.domain,
+                &payload.payload_hash,
+            );
             let all_ok = domain_ok
                 && nonce_ok
                 && balance_ok
@@ -177,6 +184,19 @@ pub mod pallet {
         }
     }
 
+    /// Pluggable per-domain business-rule gate (spec §7 "domain-specific
+    /// rules"). The runtime supplies real per-domain logic; the default `()`
+    /// implementation allows everything. Evaluated by the offchain worker in
+    /// `compute_checks_hash` — a payload failing it is simply never attested.
+    pub trait DomainRules<AccountId> {
+        fn is_allowed(creator: &AccountId, domain: u32, payload_hash: &[u8; 32]) -> bool;
+    }
+    impl<AccountId> DomainRules<AccountId> for () {
+        fn is_allowed(_creator: &AccountId, _domain: u32, _payload_hash: &[u8; 32]) -> bool {
+            true
+        }
+    }
+
     // --------------------------------------------------------
     // Pallet configuration trait
     // --------------------------------------------------------
@@ -228,6 +248,8 @@ pub mod pallet {
         /// Pluggable KYC provider for payload creators (spec §7). Default `()`
         /// approves everyone.
         type KycProvider: KycProvider<Self::AccountId>;
+        /// Pluggable per-domain business rules (spec §7). Default `()` allows all.
+        type DomainRules: DomainRules<Self::AccountId>;
         /// Minimum number of blocks between submissions from the same creator
         /// (per-creator rate limit, spec §7). `0` disables it.
         type SubmitCooldown: Get<BlockNumberFor<Self>>;
