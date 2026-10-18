@@ -17,7 +17,7 @@
 //   pm2 save                          # persist across reboot
 // ============================================================
 
-const CWD = '/home/srijith/my-blockchain';
+const CWD = '/root/my-blockchain';
 
 // Alice must come up first: she is the bootnode the others dial via the
 // fixed --node-key in run-alice.sh.

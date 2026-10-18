@@ -20,7 +20,7 @@ if [[ ! -d "${BASE_PATH}/chains" ]]; then
 fi
 
 # No --validator flag (Charlie isn't an AURA block author).
-# But --offchain-worker always so the FastLane OCW still runs and
+# But --offchain-worker (default never; set OFFCHAIN_WORKER=always) so the FastLane OCW still runs and
 # signs attestations.
 exec "${NODE_BIN}" \
   --base-path "${BASE_PATH}" \
@@ -31,6 +31,6 @@ exec "${NODE_BIN}" \
   --unsafe-rpc-external \
   --rpc-cors all \
   --rpc-methods safe \
-  --offchain-worker always \
+  --offchain-worker "${OFFCHAIN_WORKER:-never}" \
   --enable-offchain-indexing true \
   --bootnodes "/ip4/127.0.0.1/tcp/30333/p2p/${ALICE_PEER_ID}"

@@ -116,7 +116,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// (default allow-all) evaluated in the OCW's compute_checks_hash — the last
 	// hardcoded `true` check is gone. Output-equivalent under the default
 	// providers, so checks_hash is unchanged on this testnet.
-	spec_version: 112,
+	spec_version: 113,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
 	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the

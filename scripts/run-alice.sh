@@ -25,6 +25,6 @@ exec "${NODE_BIN}" \
   --unsafe-rpc-external \
   --rpc-cors all \
   --rpc-methods safe \
-  --offchain-worker always \
+  --offchain-worker "${OFFCHAIN_WORKER:-never}" \
   --enable-offchain-indexing true \
   --node-key 0000000000000000000000000000000000000000000000000000000000000001

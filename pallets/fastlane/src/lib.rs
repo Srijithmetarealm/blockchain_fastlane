@@ -44,14 +44,13 @@ pub mod pallet {
 
     use frame_system::{
         offchain::{
-            AppCrypto, CreateSignedTransaction, SubmitTransaction,
+            AppCrypto, CreateSignedTransaction,
         },
         pallet_prelude::*,
     };
 
     use sp_runtime::{
         traits::Zero,
-        offchain::storage::StorageValueRef,
         transaction_validity::{
             InvalidTransaction, TransactionSource, TransactionValidity,
             ValidTransaction,
@@ -772,151 +771,6 @@ pub mod pallet {
 
             T::WeightInfo::on_initialize_expire(expired_count)
                 .saturating_add(T::WeightInfo::on_initialize_finalize(finalized_count))
-        }
-
-        // --------------------------------------------------------
-        // Offchain worker — monitors Submitted payloads, signs each one,
-        // and submits an unsigned attest_unsigned transaction.
-        //
-        // FIX (major): the previous implementation:
-        //   1. Sent authority_encoded = Vec::new() — so validate_unsigned
-        //      always rejected the tx (AccountId::decode fails on empty slice).
-        //   2. Never used the Signer to produce a real signature — just
-        //      forwarded the msg_hash bytes as the "signature", which would
-        //      always fail sr25519_verify on-chain.
-        //   3. Had the Signer wiring completely commented out.
-        //
-        // Fixed approach:
-        //   • Use Signer::<T, T::AuthorityId>::all_accounts() to enumerate
-        //     every local key that belongs to an on-chain authority.
-        //   • Build the canonical message (payload_id ++ expiry_encoded) and
-        //     let the Signer sign it.
-        //   • Pack the result into an AttestationPayload and submit it as an
-        //     unsigned transaction whose outer signature is verified by
-        //     validate_unsigned.
-        // --------------------------------------------------------
-        fn offchain_worker(block_number: BlockNumberFor<T>) {
-            // Avoid re-processing the same block on restart.
-            let store = StorageValueRef::persistent(b"fastlane::last_ocw_block");
-            if let Ok(Some(last)) = store.get::<BlockNumberFor<T>>() {
-                if last >= block_number {
-                    return;
-                }
-            }
-            store.set(&block_number);
-
-            // Enumerate local sr25519 keys registered under the "fast" key type.
-            let local_keys =
-                sp_io::crypto::sr25519_public_keys(crate::crypto::KEY_TYPE);
-            if local_keys.is_empty() {
-                return;
-            }
-
-            // §14 (production): make sure each local authority's RANDOM BLS
-            // public key is registered on-chain before we attest with it. The
-            // secret is generated once per node and kept in offchain-local
-            // storage — never derived from public data — so BLS attestations
-            // are unforgeable.
-            {
-                let authorities = Authorities::<T>::get();
-                for key_pub in &local_keys {
-                    if let Ok(auth) = T::AccountId::decode(&mut key_pub.0.as_ref()) {
-                        if authorities.contains(&auth) {
-                            Self::ocw_ensure_bls_registered(key_pub, &auth);
-                        }
-                    }
-                }
-            }
-
-            for (payload_id, status) in Statuses::<T>::iter() {
-                if status != Status::Submitted {
-                    continue;
-                }
-
-                let payload = match Payloads::<T>::get(payload_id) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let checks_hash =
-                    match T::OffchainChecks::compute_checks_hash(&payload) {
-                        Some(h) => h,
-                        None => continue,
-                    };
-
-                let authorities = Authorities::<T>::get();
-                if authorities.is_empty() {
-                    continue;
-                }
-
-                // Canonical message — same bytes verified by do_attest.
-                let mut msg = payload_id.to_vec();
-                msg.extend_from_slice(&payload.expiry.encode());
-                msg.extend_from_slice(&checks_hash);
-                let msg_hash: [u8; 32] = sp_io::hashing::blake2_256(&msg);
-
-                for key_pub in &local_keys {
-                    // In sr25519 runtimes the AccountId IS the raw public key.
-                    let auth = match T::AccountId::decode(
-                        &mut key_pub.0.as_ref(),
-                    ) {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-
-                    if !authorities.contains(&auth) {
-                        continue;
-                    }
-
-                    // Skip if we already attested this payload.
-                    if Attestations::<T>::get(payload_id)
-                        .iter()
-                        .any(|r| r.authority == auth)
-                    {
-                        continue;
-                    }
-
-                    if let Some(raw_sig) = sp_io::crypto::sr25519_sign(
-                        crate::crypto::KEY_TYPE,
-                        key_pub,
-                        &msg_hash,
-                    ) {
-                        let call = Call::attest_unsigned {
-                            payload_id,
-                            authority_encoded: auth.encode(),
-                            // 64-byte raw sig — handled by do_attest's len==64 branch.
-                            signature: raw_sig.0.to_vec(),
-                            checks_hash,
-                        };
-                        let xt = T::create_inherent(call.into());
-                        let _ = SubmitTransaction::<T, Call<T>>::submit_transaction(xt);
-                    }
-
-                    // §14: also submit a real BLS attestation, signed with this
-                    // node's RANDOM per-node secret. Only once our matching
-                    // public key is registered on-chain (handled above), and
-                    // only if we haven't already BLS-attested this payload.
-                    let ocw_seed = Self::ocw_bls_seed(&auth);
-                    let my_bls_pub = Self::bls_public_from_seed(&ocw_seed);
-                    let registered_match = AuthorityBlsKeys::<T>::get(&auth)
-                        .map_or(false, |k| k.as_slice() == my_bls_pub.as_slice());
-                    if registered_match
-                        && !BlsAttestations::<T>::get(payload_id)
-                            .iter()
-                            .any(|(a, _)| a == &auth)
-                    {
-                        let bls_sig = Self::bls_sign_with_seed(&ocw_seed, &payload_id);
-                        let bls_call = Call::attest_bls_unsigned {
-                            payload_id,
-                            authority_encoded: auth.encode(),
-                            signature: bls_sig,
-                        };
-                        let bls_xt = T::create_inherent(bls_call.into());
-                        let _ =
-                            SubmitTransaction::<T, Call<T>>::submit_transaction(bls_xt);
-                    }
-                }
-            }
         }
     }
 
@@ -1726,7 +1580,7 @@ pub mod pallet {
         /// Deterministic per-authority BLS seed. Bootstrap-only: derived from
         /// the (public) account so a fresh chain has BLS keys at genesis without
         /// key distribution. NOT secret — each node overrides it on startup with
-        /// a random key via `ocw_ensure_bls_registered`.
+        /// a random key via the external attestor.
         pub fn bls_seed(authority: &T::AccountId) -> [u8; 32] {
             sp_io::hashing::blake2_256(&(b"fastlane-bls-seed", authority).encode())
         }
@@ -1737,55 +1591,6 @@ pub mod pallet {
             let mut msg = b"fastlane-bls-register".to_vec();
             msg.extend_from_slice(public_key);
             sp_io::hashing::blake2_256(&msg)
-        }
-
-        /// This node's persistent RANDOM BLS seed for `auth`, generated once and
-        /// kept in offchain-local storage. Never derived from public data, so
-        /// the resulting BLS secret is unforgeable (production-grade).
-        fn ocw_bls_seed(auth: &T::AccountId) -> [u8; 32] {
-            let mut skey = b"fastlane::bls-seed::".to_vec();
-            skey.extend_from_slice(&auth.encode());
-            let store = StorageValueRef::persistent(&skey);
-            if let Ok(Some(seed)) = store.get::<[u8; 32]>() {
-                return seed;
-            }
-            let random = sp_io::offchain::random_seed();
-            let seed = sp_io::hashing::blake2_256(
-                &(b"fastlane-bls-rand", auth, random).encode(),
-            );
-            store.set(&seed);
-            seed
-        }
-
-        /// Ensure this authority's RANDOM BLS public key is registered on-chain.
-        /// If it isn't (fresh node, or a bootstrap/account-derived key is still
-        /// in place), submit a self-authenticated unsigned registration proven
-        /// by an sr25519 signature from the authority's key.
-        fn ocw_ensure_bls_registered(
-            key_pub: &sp_core::sr25519::Public,
-            auth: &T::AccountId,
-        ) {
-            let seed = Self::ocw_bls_seed(auth);
-            let my_pub = Self::bls_public_from_seed(&seed);
-            if let Some(onchain) = AuthorityBlsKeys::<T>::get(auth) {
-                if onchain.as_slice() == my_pub.as_slice() {
-                    return;
-                }
-            }
-            let msg_hash = Self::bls_register_message(&my_pub);
-            if let Some(sig) = sp_io::crypto::sr25519_sign(
-                crate::crypto::KEY_TYPE,
-                key_pub,
-                &msg_hash,
-            ) {
-                let call = Call::register_bls_key_unsigned {
-                    authority_encoded: auth.encode(),
-                    public_key: my_pub,
-                    proof: sig.0.to_vec(),
-                };
-                let xt = T::create_inherent(call.into());
-                let _ = SubmitTransaction::<T, Call<T>>::submit_transaction(xt);
-            }
         }
 
         /// Shared BLS-attestation logic for `attest_bls` (signed) and

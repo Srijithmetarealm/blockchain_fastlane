@@ -27,6 +27,6 @@ exec "${NODE_BIN}" \
   --unsafe-rpc-external \
   --rpc-cors all \
   --rpc-methods safe \
-  --offchain-worker always \
+  --offchain-worker "${OFFCHAIN_WORKER:-never}" \
   --enable-offchain-indexing true \
   --bootnodes "/ip4/127.0.0.1/tcp/30333/p2p/${ALICE_PEER_ID}"
