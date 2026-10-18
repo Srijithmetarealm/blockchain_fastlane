@@ -14,6 +14,10 @@ pub mod weights;
 mod mock;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod bls_aggregation_tests;
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
 
 
 #[frame_support::pallet]
@@ -35,19 +39,18 @@ pub mod pallet {
 
     use frame_support::{
         pallet_prelude::*,
-        traits::{Currency, ReservableCurrency},
+        traits::{ConstU32, Currency, ReservableCurrency},
     };
 
     use frame_system::{
         offchain::{
-            AppCrypto, CreateSignedTransaction, SubmitTransaction,
+            AppCrypto, CreateSignedTransaction,
         },
         pallet_prelude::*,
     };
 
     use sp_runtime::{
         traits::Zero,
-        offchain::storage::StorageValueRef,
         transaction_validity::{
             InvalidTransaction, TransactionSource, TransactionValidity,
             ValidTransaction,
@@ -105,9 +108,16 @@ pub mod pallet {
             let nonce_ok =
                 Nonces::<T>::get(&payload.creator) >= payload.nonce.saturating_add(1);
             let balance_ok = !T::Currency::free_balance(&payload.creator).is_zero();
-            let kyc_ok = true;
+            // KYC re-checked here (also enforced at submit) for defense in depth.
+            let kyc_ok = T::KycProvider::is_verified(&payload.creator);
+            // Rate limit is stateful and already enforced at submit().
             let rate_limit_ok = true;
-            let domain_specific_ok = true;
+            // §7: real, pluggable per-domain business rules (default: allow all).
+            let domain_specific_ok = T::DomainRules::is_allowed(
+                &payload.creator,
+                payload.domain,
+                &payload.payload_hash,
+            );
             let all_ok = domain_ok
                 && nonce_ok
                 && balance_ok
@@ -139,11 +149,17 @@ pub mod pallet {
     }
 
     /// Downstream pallets use this trait as a gateway guard.
-    pub trait EnsurePreConsensed<T: Config> {
+    ///
+    /// Intentionally NOT generic over `Config`: a consumer pallet (e.g.
+    /// `pallet-template`) must be able to name this trait as a config bound
+    /// without knowing FastLane's concrete runtime `Config`. In the runtime,
+    /// `pallet_fastlane::Pallet<Runtime>` is the implementor, so a downstream
+    /// pallet sets `type PreConsensusGate = Fastlane;`.
+    pub trait EnsurePreConsensed {
         fn ensure_preconsensed(payload_id: PayloadId) -> DispatchResult;
     }
 
-    impl<T: Config> EnsurePreConsensed<T> for Pallet<T> {
+    impl<T: Config> EnsurePreConsensed for Pallet<T> {
         fn ensure_preconsensed(payload_id: PayloadId) -> DispatchResult {
             let status = Statuses::<T>::get(payload_id)
                 .ok_or(Error::<T>::PayloadNotFound)?;
@@ -152,6 +168,31 @@ pub mod pallet {
                 Error::<T>::ThresholdNotMet
             );
             Ok(())
+        }
+    }
+
+    /// Pluggable KYC gate for payload creators (spec §7). The runtime supplies
+    /// real KYC logic; the default `()` implementation approves everyone, which
+    /// is appropriate for a permissionless testnet. Enforced in `submit`.
+    pub trait KycProvider<AccountId> {
+        fn is_verified(who: &AccountId) -> bool;
+    }
+    impl<AccountId> KycProvider<AccountId> for () {
+        fn is_verified(_who: &AccountId) -> bool {
+            true
+        }
+    }
+
+    /// Pluggable per-domain business-rule gate (spec §7 "domain-specific
+    /// rules"). The runtime supplies real per-domain logic; the default `()`
+    /// implementation allows everything. Evaluated by the offchain worker in
+    /// `compute_checks_hash` — a payload failing it is simply never attested.
+    pub trait DomainRules<AccountId> {
+        fn is_allowed(creator: &AccountId, domain: u32, payload_hash: &[u8; 32]) -> bool;
+    }
+    impl<AccountId> DomainRules<AccountId> for () {
+        fn is_allowed(_creator: &AccountId, _domain: u32, _payload_hash: &[u8; 32]) -> bool {
+            true
         }
     }
 
@@ -193,9 +234,24 @@ pub mod pallet {
         type OffchainChecks: OffchainChecks<Self>;
         /// Maximum number of PreConsensed payloads auto-finalized in one block.
         type MaxAutoFinalizePerBlock: Get<u32>;
+        /// Number of blocks a payload stays PreConsensed before it is
+        /// auto-finalised. `0` schedules finalisation at the very next block
+        /// (effectively immediate); a larger value opens a window in which
+        /// authorities can post inclusion commitments (§14) before the payload
+        /// becomes canonical. Resolves the §6.3-vs-§14 tension: finalisation is
+        /// still automatic, just deferred by this many blocks.
+        type FinalizeDelay: Get<BlockNumberFor<Self>>;
         /// Maximum number of payloads expired in one block. Bounds the work
         /// performed in `on_initialize` so the chain cannot stall under load.
         type MaxExpiriesPerBlock: Get<u32>;
+        /// Pluggable KYC provider for payload creators (spec §7). Default `()`
+        /// approves everyone.
+        type KycProvider: KycProvider<Self::AccountId>;
+        /// Pluggable per-domain business rules (spec §7). Default `()` allows all.
+        type DomainRules: DomainRules<Self::AccountId>;
+        /// Minimum number of blocks between submissions from the same creator
+        /// (per-creator rate limit, spec §7). `0` disables it.
+        type SubmitCooldown: Get<BlockNumberFor<Self>>;
         /// Benchmarked weights.
         type WeightInfo: crate::weights::WeightInfo;
     }
@@ -272,6 +328,17 @@ pub mod pallet {
     #[pallet::getter(fn pending_count)]
     pub type PendingCount<T: Config> = StorageValue<_, u32, ValueQuery>;
 
+    /// Last block at which each creator submitted — enforces the per-creator
+    /// submission cooldown (rate limiting, spec §7).
+    #[pallet::storage]
+    pub type LastSubmitAt<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        BlockNumberFor<T>,
+        OptionQuery,
+    >;
+
     /// Per-block expiry index. When the chain reaches block `expiry + 1`,
     /// `on_initialize` drains `ExpiryAt[expiry + 1]` and marks any still-
     /// Submitted payloads as Expired. Eliminates the O(n) full-storage scan.
@@ -284,13 +351,97 @@ pub mod pallet {
         ValueQuery,
     >;
 
-    /// FIFO queue of payloads in PreConsensed state awaiting auto-finalisation.
-    /// Drained `MaxAutoFinalizePerBlock` items per block in `on_initialize`.
+    /// Legacy FIFO queue of PreConsensed payloads. Superseded by the block-
+    /// indexed `FinalizeAt` schedule (which supports a finalisation delay), but
+    /// retained so any entries present at a runtime upgrade are still drained by
+    /// `on_initialize`. New payloads are scheduled via `FinalizeAt`.
     #[pallet::storage]
     pub type PreConsensedQueue<T: Config> = StorageValue<
         _,
         BoundedVec<PayloadId, T::MaxPendingPayloads>,
         ValueQuery,
+    >;
+
+    /// Per-block auto-finalisation schedule. When a payload reaches threshold at
+    /// block `b` it is scheduled at `b + FinalizeDelay`; `on_initialize` drains
+    /// `FinalizeAt[now]` (bounded by `MaxAutoFinalizePerBlock`, rescheduling any
+    /// overflow to the next block). The delay is the window during which
+    /// inclusion commitments (§14) can be posted against a PreConsensed payload.
+    #[pallet::storage]
+    pub type FinalizeAt<T: Config> = StorageMap<
+        _,
+        Twox64Concat,
+        BlockNumberFor<T>,
+        BoundedVec<PayloadId, T::MaxPendingPayloads>,
+        ValueQuery,
+    >;
+
+    /// Compact aggregate of the attestation set, written when a payload reaches
+    /// threshold. Survives finalisation (unlike `Attestations`, which is pruned)
+    /// so an explorer can always prove which authorities pre-consensed a payload.
+    #[pallet::storage]
+    #[pallet::getter(fn aggregated_attestation)]
+    pub type AggregatedAttestations<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        PayloadId,
+        AggregatedAttestation,
+        OptionQuery,
+    >;
+
+    /// Per-payload inclusion commitments — authorities' signed promises to
+    /// finalise a PreConsensed payload by a deadline block.
+    #[pallet::storage]
+    #[pallet::getter(fn inclusion_commitments)]
+    pub type InclusionCommitments<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        PayloadId,
+        BoundedVec<InclusionCommitment<T>, T::MaxAuthorities>,
+        ValueQuery,
+    >;
+
+    // --------------------------------------------------------
+    // §14 real-BLS storage
+    // --------------------------------------------------------
+
+    /// Per-authority registered BLS12-381 public key (w3f-bls compressed bytes,
+    /// TinyBLS381 public group ≈ 96 bytes). Set via `register_bls_key`.
+    #[pallet::storage]
+    #[pallet::getter(fn authority_bls_key)]
+    pub type AuthorityBlsKeys<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        BoundedVec<u8, ConstU32<128>>,
+        OptionQuery,
+    >;
+
+    /// Raw per-authority BLS signatures collected for a payload, before they are
+    /// collapsed into a single aggregate. Each signature ≈ 48 bytes (G1).
+    #[pallet::storage]
+    #[pallet::getter(fn bls_attestations)]
+    pub type BlsAttestations<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        PayloadId,
+        BoundedVec<(T::AccountId, BoundedVec<u8, ConstU32<64>>), T::MaxAuthorities>,
+        ValueQuery,
+    >;
+
+    /// The single aggregated BLS signature for a payload, written once the
+    /// threshold is reached. This is the real §14 storage reduction: N × 48-byte
+    /// signatures collapse to one 48-byte aggregate that still verifies against
+    /// the committee's public keys.
+    #[pallet::storage]
+    #[pallet::getter(fn bls_aggregate)]
+    pub type BlsAggregate<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        PayloadId,
+        
+        BoundedVec<u8, ConstU32<64>>,
+        OptionQuery,
     >;
 
     // --------------------------------------------------------
@@ -320,6 +471,20 @@ pub mod pallet {
         /// below `MinAuthorityBond` (typically after a slash). The chain may
         /// require governance intervention if the threshold is now unreachable.
         AuthorityEvicted { authority: T::AccountId },
+        /// Threshold reached — the per-authority signatures were collapsed into
+        /// a compact `AggregatedAttestation` (spec §14 storage reduction).
+        AttestationsAggregated { payload_id: PayloadId, count: u32 },
+        /// An authority committed to include a payload by `deadline`.
+        InclusionCommitted {
+            payload_id: PayloadId,
+            authority: T::AccountId,
+            deadline: BlockNumberFor<T>,
+        },
+        /// An authority registered its BLS public key (§14).
+        BlsKeyRegistered { authority: T::AccountId },
+        /// Threshold BLS attestations collected — collapsed into one aggregate
+        /// signature stored in `BlsAggregate` (§14 real signature aggregation).
+        BlsAggregated { payload_id: PayloadId, count: u32 },
     }
 
     // --------------------------------------------------------
@@ -348,6 +513,24 @@ pub mod pallet {
         InsufficientBalance,
         SlashExceedsBond,
         MissingSlashProof,
+        /// Inclusion commitment requires the payload to be PreConsensed.
+        NotPreConsensed,
+        /// This authority already posted an inclusion commitment for the payload.
+        AlreadyCommitted,
+        /// Inclusion deadline must be strictly in the future.
+        InvalidDeadline,
+        /// The authority has not registered a BLS public key.
+        BlsKeyNotRegistered,
+        /// The supplied bytes are not a valid BLS public key.
+        InvalidBlsPublicKey,
+        /// The BLS signature failed verification against the registered key.
+        InvalidBlsSignature,
+        /// This authority already submitted a BLS attestation for the payload.
+        BlsAlreadyAttested,
+        /// The creator is not KYC-verified (spec §7).
+        NotKycVerified,
+        /// The creator submitted too recently — per-creator rate limit (§7).
+        SubmitTooFrequent,
     }
 
     // --------------------------------------------------------
@@ -389,6 +572,40 @@ pub mod pallet {
         pub checks_hash: [u8; 32],
     }
 
+    /// Compact, permanent record of the attestation set for a payload
+    /// (spec §14: "Signature aggregation to reduce storage").
+    ///
+    /// Built the moment the threshold is reached. Once a payload is finalised
+    /// the full per-authority `Attestations` list is pruned and only this
+    /// aggregate remains — reducing the long-term storage footprint of a
+    /// finalised payload from `count × (32 + 64 + 32)` bytes to a fixed
+    /// `8 + 32 + 4` bytes, while still proving *which* authorities signed
+    /// (`signer_bitmap`) and committing to the exact signatures (`digest`).
+    #[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+    pub struct AggregatedAttestation {
+        /// Bit `i` set ⇔ `Authorities[i]` contributed a signature. Supports up
+        /// to 64 authorities, comfortably above the runtime's MaxAuthorities.
+        pub signer_bitmap: u64,
+        /// blake2_256 over the concatenation of every contributing signature,
+        /// in authority order. A verifiable commitment to the aggregated set.
+        pub digest: [u8; 32],
+        /// Number of signatures aggregated (popcount of `signer_bitmap`).
+        pub count: u32,
+    }
+
+    /// An authority's signed promise to include/finalise a PreConsensed payload
+    /// by `deadline` (spec §14 "Inclusion commitment"). If the payload is not
+    /// Finalised by `deadline`, the authority is slashable via
+    /// `SlashProof::BrokenInclusion`.
+    #[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo)]
+    #[scale_info(skip_type_params(T))]
+    pub struct InclusionCommitment<T: Config> {
+        pub authority: T::AccountId,
+        pub committed_at: BlockNumberFor<T>,
+        pub deadline: BlockNumberFor<T>,
+        pub signature: Vec<u8>,
+    }
+
 
     // --------------------------------------------------------
     // Slash proof type
@@ -402,6 +619,9 @@ pub mod pallet {
         DoubleSigning(PayloadId, Vec<u8>, PayloadId, Vec<u8>),
         /// Authority submitted a signature that fails on-chain verification.
         InvalidSignature(PayloadId, Vec<u8>),
+        /// Authority committed to include `payload_id` but the deadline passed
+        /// with the payload still not finalised.
+        BrokenInclusion(PayloadId),
     }
 
     // --------------------------------------------------------
@@ -436,6 +656,14 @@ pub mod pallet {
                     }
                 }
             }
+
+            // §14: BLS keys are NOT populated at genesis. Each authority's node
+            // generates a random secret and self-registers its public key on
+            // startup (ocw_ensure_bls_registered → register_bls_key_unsigned),
+            // so no guessable, account-derived key is ever active on-chain.
+            // BLS aggregation therefore begins a few blocks after genesis, once
+            // nodes have registered — a deliberate security-over-convenience
+            // trade-off.
 
             Authorities::<T>::put(bounded);
             Threshold::<T>::put(self.threshold);
@@ -486,128 +714,63 @@ pub mod pallet {
                 });
             }
 
-            // Drain auto-finalisations from the PreConsensed queue.
+            // Drain auto-finalisations. Budget is shared across the legacy queue
+            // and the block-indexed schedule so per-block work stays bounded.
             let max_finalize = T::MaxAutoFinalizePerBlock::get() as usize;
             let mut finalized_count: u32 = 0;
+
+            // (a) Legacy PreConsensedQueue — drains any entries left over from
+            //     before the FinalizeAt schedule existed. Status-guarded so a
+            //     manually-finalised payload is not finalised twice.
             PreConsensedQueue::<T>::mutate(|queue| {
                 let take = max_finalize.min(queue.len());
                 for _ in 0..take {
                     let payload_id = queue.remove(0);
-                    if T::OnFinalised::on_finalised(payload_id).is_ok() {
+                    if matches!(Statuses::<T>::get(payload_id), Some(Status::PreConsensed))
+                        && T::OnFinalised::on_finalised(payload_id).is_ok()
+                    {
                         Statuses::<T>::insert(payload_id, Status::Finalised);
+                        Self::prune_finalised_storage(payload_id);
                         Self::deposit_event(Event::Finalised { payload_id });
                         finalized_count = finalized_count.saturating_add(1);
                     }
                 }
             });
 
+            // (b) Block-indexed FinalizeAt schedule for `now`. Overflow beyond
+            //     the remaining budget is rescheduled to the next block.
+            let scheduled_fin = FinalizeAt::<T>::take(now);
+            let mut fin_leftovers: Vec<PayloadId> = Vec::new();
+            for payload_id in scheduled_fin.into_iter() {
+                if (finalized_count as usize) >= max_finalize {
+                    fin_leftovers.push(payload_id);
+                    continue;
+                }
+                // Skip anything already finalised via manual finalize() — the
+                // status guard makes auto-finalisation idempotent, so finalize()
+                // needs no bookkeeping against this schedule.
+                if matches!(Statuses::<T>::get(payload_id), Some(Status::PreConsensed))
+                    && T::OnFinalised::on_finalised(payload_id).is_ok()
+                {
+                    Statuses::<T>::insert(payload_id, Status::Finalised);
+                    Self::prune_finalised_storage(payload_id);
+                    Self::deposit_event(Event::Finalised { payload_id });
+                    finalized_count = finalized_count.saturating_add(1);
+                }
+            }
+            if !fin_leftovers.is_empty() {
+                let next_block = now.saturating_add(1u32.into());
+                FinalizeAt::<T>::mutate(next_block, |q| {
+                    for id in fin_leftovers {
+                        if q.try_push(id).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
             T::WeightInfo::on_initialize_expire(expired_count)
                 .saturating_add(T::WeightInfo::on_initialize_finalize(finalized_count))
-        }
-
-        // --------------------------------------------------------
-        // Offchain worker — monitors Submitted payloads, signs each one,
-        // and submits an unsigned attest_unsigned transaction.
-        //
-        // FIX (major): the previous implementation:
-        //   1. Sent authority_encoded = Vec::new() — so validate_unsigned
-        //      always rejected the tx (AccountId::decode fails on empty slice).
-        //   2. Never used the Signer to produce a real signature — just
-        //      forwarded the msg_hash bytes as the "signature", which would
-        //      always fail sr25519_verify on-chain.
-        //   3. Had the Signer wiring completely commented out.
-        //
-        // Fixed approach:
-        //   • Use Signer::<T, T::AuthorityId>::all_accounts() to enumerate
-        //     every local key that belongs to an on-chain authority.
-        //   • Build the canonical message (payload_id ++ expiry_encoded) and
-        //     let the Signer sign it.
-        //   • Pack the result into an AttestationPayload and submit it as an
-        //     unsigned transaction whose outer signature is verified by
-        //     validate_unsigned.
-        // --------------------------------------------------------
-        fn offchain_worker(block_number: BlockNumberFor<T>) {
-            // Avoid re-processing the same block on restart.
-            let store = StorageValueRef::persistent(b"fastlane::last_ocw_block");
-            if let Ok(Some(last)) = store.get::<BlockNumberFor<T>>() {
-                if last >= block_number {
-                    return;
-                }
-            }
-            store.set(&block_number);
-
-            // Enumerate local sr25519 keys registered under the "fast" key type.
-            let local_keys =
-                sp_io::crypto::sr25519_public_keys(crate::crypto::KEY_TYPE);
-            if local_keys.is_empty() {
-                return;
-            }
-
-            for (payload_id, status) in Statuses::<T>::iter() {
-                if status != Status::Submitted {
-                    continue;
-                }
-
-                let payload = match Payloads::<T>::get(payload_id) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let checks_hash =
-                    match T::OffchainChecks::compute_checks_hash(&payload) {
-                        Some(h) => h,
-                        None => continue,
-                    };
-
-                let authorities = Authorities::<T>::get();
-                if authorities.is_empty() {
-                    continue;
-                }
-
-                // Canonical message — same bytes verified by do_attest.
-                let mut msg = payload_id.to_vec();
-                msg.extend_from_slice(&payload.expiry.encode());
-                msg.extend_from_slice(&checks_hash);
-                let msg_hash: [u8; 32] = sp_io::hashing::blake2_256(&msg);
-
-                for key_pub in &local_keys {
-                    // In sr25519 runtimes the AccountId IS the raw public key.
-                    let auth = match T::AccountId::decode(
-                        &mut key_pub.0.as_ref(),
-                    ) {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-
-                    if !authorities.contains(&auth) {
-                        continue;
-                    }
-
-                    // Skip if we already attested this payload.
-                    if Attestations::<T>::get(payload_id)
-                        .iter()
-                        .any(|r| r.authority == auth)
-                    {
-                        continue;
-                    }
-
-                    if let Some(raw_sig) = sp_io::crypto::sr25519_sign(
-                        crate::crypto::KEY_TYPE,
-                        key_pub,
-                        &msg_hash,
-                    ) {
-                        let call = Call::attest_unsigned {
-                            payload_id,
-                            authority_encoded: auth.encode(),
-                            // 64-byte raw sig — handled by do_attest's len==64 branch.
-                            signature: raw_sig.0.to_vec(),
-                            checks_hash,
-                        };
-                        let xt = T::create_inherent(call.into());
-                        let _ = SubmitTransaction::<T, Call<T>>::submit_transaction(xt);
-                    }
-                }
-            }
         }
     }
 
@@ -679,6 +842,83 @@ pub mod pallet {
                     .and_provides((payload_id, authority_encoded))
                     .propagate(true)
                     .build()
+            } else if let Call::attest_bls_unsigned {
+                payload_id,
+                authority_encoded,
+                signature,
+            } = call
+            {
+                // The payload must exist and be unexpired; the BLS signature
+                // must verify against the authority's registered key. That
+                // verification is the proof of authenticity for this unsigned tx.
+                let payload = Payloads::<T>::get(payload_id)
+                    .ok_or(InvalidTransaction::Stale)?;
+                let now = frame_system::Pallet::<T>::block_number();
+                if now > payload.expiry {
+                    return InvalidTransaction::Stale.into();
+                }
+
+                let authority = T::AccountId::decode(
+                    &mut authority_encoded.as_slice(),
+                )
+                .map_err(|_| InvalidTransaction::BadProof)?;
+
+                let authorities = Authorities::<T>::get();
+                if !authorities.contains(&authority) {
+                    return InvalidTransaction::BadProof.into();
+                }
+
+                // Already collected this authority's BLS signature? Stale.
+                if BlsAttestations::<T>::get(payload_id)
+                    .iter()
+                    .any(|(a, _)| a == &authority)
+                {
+                    return InvalidTransaction::Stale.into();
+                }
+
+                let pubkey = AuthorityBlsKeys::<T>::get(&authority)
+                    .ok_or(InvalidTransaction::BadProof)?;
+                if !Self::bls_verify_single(payload_id, pubkey.as_slice(), signature) {
+                    return InvalidTransaction::BadProof.into();
+                }
+
+                ValidTransaction::with_tag_prefix("FastLaneBlsAttest")
+                    .priority(100)
+                    .longevity(5)
+                    .and_provides((b"bls", payload_id, authority_encoded))
+                    .propagate(true)
+                    .build()
+            } else if let Call::register_bls_key_unsigned {
+                authority_encoded,
+                public_key,
+                proof,
+            } = call
+            {
+                let authority = T::AccountId::decode(&mut authority_encoded.as_slice())
+                    .map_err(|_| InvalidTransaction::BadProof)?;
+                let authorities = Authorities::<T>::get();
+                if !authorities.contains(&authority) {
+                    return InvalidTransaction::BadProof.into();
+                }
+                if !Self::bls_public_key_valid(public_key) {
+                    return InvalidTransaction::BadProof.into();
+                }
+                // Already registered with this exact key — nothing to do.
+                if let Some(existing) = AuthorityBlsKeys::<T>::get(&authority) {
+                    if existing.as_slice() == public_key.as_slice() {
+                        return InvalidTransaction::Stale.into();
+                    }
+                }
+                let msg_hash = Self::bls_register_message(public_key);
+                if Self::verify_authority_sig(&authority, &msg_hash, proof).is_err() {
+                    return InvalidTransaction::BadProof.into();
+                }
+                ValidTransaction::with_tag_prefix("FastLaneBlsRegister")
+                    .priority(100)
+                    .longevity(5)
+                    .and_provides((b"blsreg", authority_encoded, public_key))
+                    .propagate(true)
+                    .build()
             } else {
                 InvalidTransaction::Call.into()
             }
@@ -708,6 +948,23 @@ pub mod pallet {
 
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(expiry > now, Error::<T>::PayloadExpired);
+
+            // §7: KYC gate for the creator (pluggable; default approves all).
+            ensure!(
+                T::KycProvider::is_verified(&who),
+                Error::<T>::NotKycVerified
+            );
+
+            // §7: per-creator submission rate limit.
+            let cooldown = T::SubmitCooldown::get();
+            if !cooldown.is_zero() {
+                if let Some(last) = LastSubmitAt::<T>::get(&who) {
+                    ensure!(
+                        now >= last.saturating_add(cooldown),
+                        Error::<T>::SubmitTooFrequent
+                    );
+                }
+            }
 
             let expected_nonce = Nonces::<T>::get(&who);
             ensure!(nonce == expected_nonce, Error::<T>::InvalidNonce);
@@ -756,6 +1013,7 @@ pub mod pallet {
             Payloads::<T>::insert(payload_id, payload);
             Statuses::<T>::insert(payload_id, Status::Submitted);
             Nonces::<T>::insert(&who, nonce.saturating_add(1));
+            LastSubmitAt::<T>::insert(&who, now);
             PendingCount::<T>::mutate(|c| *c = c.saturating_add(1));
 
             Self::deposit_event(Event::Submitted { payload_id, creator: who });
@@ -808,8 +1066,11 @@ pub mod pallet {
             });
 
             Statuses::<T>::insert(payload_id, Status::Finalised);
-            Self::deposit_event(Event::Finalised { payload_id });
             T::OnFinalised::on_finalised(payload_id)?;
+            // §14: drop the full signature list + inclusion commitments; keep
+            // only the compact aggregate for the now-canonical payload.
+            Self::prune_finalised_storage(payload_id);
+            Self::deposit_event(Event::Finalised { payload_id });
 
             Ok(())
         }
@@ -829,6 +1090,10 @@ pub mod pallet {
                 let bonded = AuthorityBonds::<T>::get(auth);
                 ensure!(bonded >= T::MinAuthorityBond::get(), Error::<T>::BondTooLow);
             }
+
+            // §14: BLS keys are not auto-registered here. A newly-added
+            // authority's node self-registers its random key on startup
+            // (register_bls_key_unsigned), so no account-derived key is used.
 
             let count = new_authorities.len() as u32;
             Authorities::<T>::put(new_authorities);
@@ -965,6 +1230,168 @@ pub mod pallet {
 
             Ok(())
         }
+
+        // ----------------------------------------------------
+        // commit_inclusion — an authority signs a promise to include/finalise
+        // a PreConsensed payload by `deadline` (spec §14 inclusion commitment).
+        //
+        // Breaking the promise (deadline passes with the payload still not
+        // Finalised) is slashable via SlashProof::BrokenInclusion.
+        // ----------------------------------------------------
+        #[pallet::call_index(8)]
+        #[pallet::weight(T::WeightInfo::commit_inclusion())]
+        pub fn commit_inclusion(
+            origin: OriginFor<T>,
+            payload_id: PayloadId,
+            deadline: BlockNumberFor<T>,
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+
+            // Only registered authorities may commit.
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&who), Error::<T>::NotAuthority);
+
+            // Payload must currently be PreConsensed (fast-lane approved but not
+            // yet canonical) — that is the only window where a promise is useful.
+            let status = Statuses::<T>::get(payload_id)
+                .ok_or(Error::<T>::PayloadNotFound)?;
+            ensure!(status == Status::PreConsensed, Error::<T>::NotPreConsensed);
+
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(deadline > now, Error::<T>::InvalidDeadline);
+
+            // One commitment per authority per payload.
+            let mut commitments = InclusionCommitments::<T>::get(payload_id);
+            ensure!(
+                !commitments.iter().any(|c| c.authority == who),
+                Error::<T>::AlreadyCommitted
+            );
+
+            // Verify the signature over the canonical inclusion message.
+            let msg_hash = Self::inclusion_message_hash(&payload_id, &deadline);
+            Self::verify_authority_sig(&who, &msg_hash, &signature)?;
+
+            commitments
+                .try_push(InclusionCommitment::<T> {
+                    authority: who.clone(),
+                    committed_at: now,
+                    deadline,
+                    signature,
+                })
+                .map_err(|_| Error::<T>::AlreadyCommitted)?;
+            InclusionCommitments::<T>::insert(payload_id, commitments);
+
+            Self::deposit_event(Event::InclusionCommitted {
+                payload_id,
+                authority: who,
+                deadline,
+            });
+            Ok(())
+        }
+
+        // ----------------------------------------------------
+        // register_bls_key — an authority registers its BLS public key (§14).
+        // ----------------------------------------------------
+        #[pallet::call_index(9)]
+        #[pallet::weight(T::WeightInfo::register_bls_key())]
+        pub fn register_bls_key(
+            origin: OriginFor<T>,
+            public_key: Vec<u8>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&who), Error::<T>::NotAuthority);
+
+            // The bytes must parse as a real BLS public key.
+            ensure!(
+                Self::bls_public_key_valid(&public_key),
+                Error::<T>::InvalidBlsPublicKey
+            );
+            let bounded: BoundedVec<u8, ConstU32<128>> = public_key
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidBlsPublicKey)?;
+            AuthorityBlsKeys::<T>::insert(&who, bounded);
+
+            Self::deposit_event(Event::BlsKeyRegistered { authority: who });
+            Ok(())
+        }
+
+        // ----------------------------------------------------
+        // attest_bls — an authority submits a real BLS attestation (§14).
+        //
+        // Verifies the single BLS signature against the caller's registered
+        // key. Once the threshold is reached, all collected BLS signatures are
+        // summed into ONE aggregate signature (constant 48 bytes regardless of
+        // committee size) and stored in `BlsAggregate` — the real §14 storage
+        // reduction, verifiable against the committee's public keys.
+        // ----------------------------------------------------
+        #[pallet::call_index(10)]
+        #[pallet::weight(T::WeightInfo::attest_bls())]
+        pub fn attest_bls(
+            origin: OriginFor<T>,
+            payload_id: PayloadId,
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            Self::do_attest_bls(payload_id, who, signature)
+        }
+
+        // ----------------------------------------------------
+        // attest_bls_unsigned — the unsigned BLS variant an authority's
+        // offchain worker submits automatically. The BLS signature itself
+        // authenticates the authority (it must verify against the on-chain
+        // registered key), so no outer sr25519 signature is needed.
+        // ----------------------------------------------------
+        #[pallet::call_index(11)]
+        #[pallet::weight(T::WeightInfo::attest_bls())]
+        pub fn attest_bls_unsigned(
+            origin: OriginFor<T>,
+            payload_id: PayloadId,
+            authority_encoded: Vec<u8>,
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            ensure_none(origin)?;
+            let authority = T::AccountId::decode(&mut authority_encoded.as_slice())
+                .map_err(|_| Error::<T>::InvalidBlsSignature)?;
+            Self::do_attest_bls(payload_id, authority, signature)
+        }
+
+        // ----------------------------------------------------
+        // register_bls_key_unsigned — a node self-registers its RANDOM BLS
+        // public key, proven by an sr25519 signature from its authority key.
+        // Production path: the BLS secret is random and node-local, so the
+        // registered key cannot be forged from public data.
+        // ----------------------------------------------------
+        #[pallet::call_index(12)]
+        #[pallet::weight(T::WeightInfo::register_bls_key_unsigned())]
+        pub fn register_bls_key_unsigned(
+            origin: OriginFor<T>,
+            authority_encoded: Vec<u8>,
+            public_key: Vec<u8>,
+            proof: Vec<u8>,
+        ) -> DispatchResult {
+            ensure_none(origin)?;
+            let authority = T::AccountId::decode(&mut authority_encoded.as_slice())
+                .map_err(|_| Error::<T>::InvalidBlsPublicKey)?;
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&authority), Error::<T>::NotAuthority);
+            ensure!(
+                Self::bls_public_key_valid(&public_key),
+                Error::<T>::InvalidBlsPublicKey
+            );
+            // Proof: an sr25519 signature by the authority over the canonical
+            // registration message. Only the real authority can produce it.
+            let msg_hash = Self::bls_register_message(&public_key);
+            Self::verify_authority_sig(&authority, &msg_hash, &proof)?;
+
+            let bounded: BoundedVec<u8, ConstU32<128>> = public_key
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidBlsPublicKey)?;
+            AuthorityBlsKeys::<T>::insert(&authority, bounded);
+            Self::deposit_event(Event::BlsKeyRegistered { authority });
+            Ok(())
+        }
     }
 
     // --------------------------------------------------------
@@ -1014,33 +1441,7 @@ pub mod pallet {
             msg.extend_from_slice(&checks_hash);
             let msg_hash: [u8; 32] = sp_io::hashing::blake2_256(&msg);
 
-            let raw_account: Vec<u8> = authority.encode();
-            ensure!(raw_account.len() == 32, Error::<T>::InvalidSignature);
-            let raw_arr: [u8; 32] = raw_account
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::<T>::InvalidSignature)?;
-            let pub_key = sp_core::sr25519::Public::from_raw(raw_arr);
-
-            let sig = if signature.len() == 64 {
-                let sig_bytes: [u8; 64] = signature
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::<T>::InvalidSignature)?;
-                sp_core::sr25519::Signature::from_raw(sig_bytes)
-            } else {
-                let multi = sp_runtime::MultiSignature::decode(&mut signature.as_slice())
-                    .map_err(|_| Error::<T>::InvalidSignature)?;
-                match multi {
-                    sp_runtime::MultiSignature::Sr25519(s) => s,
-                    _ => return Err(Error::<T>::InvalidSignature.into()),
-                }
-            };
-
-            ensure!(
-                sp_io::crypto::sr25519_verify(&sig, &msg_hash, &pub_key),
-                Error::<T>::InvalidSignature
-            );
+            Self::verify_authority_sig(&authority, &msg_hash, &signature)?;
             // -----------------------------------------------
 
             let record = SignatureRecord::<T> {
@@ -1055,15 +1456,303 @@ pub mod pallet {
             if threshold > 0 && sigs.len() as u32 >= threshold {
                 Statuses::<T>::insert(payload_id, Status::PreConsensed);
                 PendingCount::<T>::mutate(|c| *c = c.saturating_sub(1));
-                // Best-effort push; if the queue is full the payload still
-                // becomes PreConsensed and can be finalised manually via the
-                // finalize() extrinsic. The bound matches MaxPendingPayloads
-                // so this can only happen under simultaneous burst load.
-                let _ = PreConsensedQueue::<T>::mutate(|q| q.try_push(payload_id));
+                // Schedule auto-finalisation at `now + FinalizeDelay`. Best-
+                // effort push; if the bucket is full the payload still becomes
+                // PreConsensed and can be finalised manually via finalize().
+                let finalize_at = now.saturating_add(T::FinalizeDelay::get());
+                let _ = FinalizeAt::<T>::mutate(finalize_at, |q| q.try_push(payload_id));
+
+                // §14 storage reduction: collapse the per-authority signatures
+                // into a compact aggregate the moment the threshold is reached.
+                let aggregate = Self::build_aggregate(&sigs);
+                let count = aggregate.count;
+                AggregatedAttestations::<T>::insert(payload_id, aggregate);
+                Self::deposit_event(Event::AttestationsAggregated { payload_id, count });
+
                 Self::deposit_event(Event::PreConsensed { payload_id });
             }
 
             Ok(())
+        }
+
+        /// Verify an sr25519 signature by `authority` over `msg_hash`. Accepts
+        /// either a raw 64-byte signature or a SCALE-encoded `MultiSignature`.
+        /// Shared by `do_attest` and `commit_inclusion`.
+        fn verify_authority_sig(
+            authority: &T::AccountId,
+            msg_hash: &[u8; 32],
+            signature: &[u8],
+        ) -> DispatchResult {
+            let raw_account: Vec<u8> = authority.encode();
+            ensure!(raw_account.len() == 32, Error::<T>::InvalidSignature);
+            let raw_arr: [u8; 32] = raw_account
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidSignature)?;
+            let pub_key = sp_core::sr25519::Public::from_raw(raw_arr);
+
+            let sig = if signature.len() == 64 {
+                let sig_bytes: [u8; 64] = signature
+                    .try_into()
+                    .map_err(|_| Error::<T>::InvalidSignature)?;
+                sp_core::sr25519::Signature::from_raw(sig_bytes)
+            } else {
+                let multi = sp_runtime::MultiSignature::decode(&mut &signature[..])
+                    .map_err(|_| Error::<T>::InvalidSignature)?;
+                match multi {
+                    sp_runtime::MultiSignature::Sr25519(s) => s,
+                    _ => return Err(Error::<T>::InvalidSignature.into()),
+                }
+            };
+
+            ensure!(
+                sp_io::crypto::sr25519_verify(&sig, msg_hash, &pub_key),
+                Error::<T>::InvalidSignature
+            );
+            Ok(())
+        }
+
+        /// Canonical BLS attestation message. Every authority signs
+        /// `Message::new(b"fastlane-attest", payload_id)`, so their signatures
+        /// share a message and therefore aggregate.
+        fn bls_message(payload_id: &PayloadId) -> w3f_bls::Message {
+            w3f_bls::Message::new(b"fastlane-attest", payload_id)
+        }
+
+        /// True if `bytes` decode to a valid BLS12-381 (TinyBLS381) public key.
+        fn bls_public_key_valid(bytes: &[u8]) -> bool {
+            use w3f_bls::{PublicKey, SerializableToBytes, TinyBLS381};
+            PublicKey::<TinyBLS381>::from_bytes(bytes).is_ok()
+        }
+
+        /// Verify one authority's BLS signature over `payload_id` against its
+        /// public key. Runs in-runtime (no host function).
+        fn bls_verify_single(
+            payload_id: &PayloadId,
+            pubkey_bytes: &[u8],
+            sig_bytes: &[u8],
+        ) -> bool {
+            use w3f_bls::{PublicKey, SerializableToBytes, Signature, TinyBLS381};
+            type Engine = TinyBLS381;
+            let pk = match PublicKey::<Engine>::from_bytes(pubkey_bytes) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let sig = match Signature::<Engine>::from_bytes(sig_bytes) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            sig.verify(&Self::bls_message(payload_id), &pk)
+        }
+
+        /// Collapse a set of raw BLS signatures into one aggregate signature by
+        /// summing their group points. Returns the aggregate's compressed bytes.
+        fn aggregate_bls_signatures(sigs: &[Vec<u8>]) -> Option<Vec<u8>> {
+            use w3f_bls::{SerializableToBytes, Signature, TinyBLS381};
+            type Engine = TinyBLS381;
+            let mut iter = sigs.iter();
+            let mut agg = Signature::<Engine>::from_bytes(iter.next()?).ok()?;
+            for s in iter {
+                let sig = Signature::<Engine>::from_bytes(s).ok()?;
+                agg.0 += sig.0;
+            }
+            Some(agg.to_bytes())
+        }
+
+        /// Deterministically derive an authority's BLS **public** key bytes from
+        /// a 32-byte seed. The matching secret never leaves the signer; the OCW
+        /// keeps it in node-local offchain storage. Used to populate genesis /
+        /// `register_bls_key`.
+        pub fn bls_public_from_seed(seed: &[u8]) -> Vec<u8> {
+            use w3f_bls::{SecretKeyVT, SerializableToBytes, TinyBLS381};
+            SecretKeyVT::<TinyBLS381>::from_seed(seed).into_public().to_bytes()
+        }
+
+        /// Deterministically BLS-sign `payload_id` with the secret derived from
+        /// `seed`. `SecretKeyVT::sign` is no_std and deterministic (no RNG), so
+        /// this is exactly what an authority's offchain worker calls to attest.
+        pub fn bls_sign_with_seed(seed: &[u8], payload_id: &PayloadId) -> Vec<u8> {
+            use w3f_bls::{SecretKeyVT, SerializableToBytes, TinyBLS381};
+            let sk = SecretKeyVT::<TinyBLS381>::from_seed(seed);
+            sk.sign(&Self::bls_message(payload_id)).to_bytes()
+        }
+
+        /// Deterministic per-authority BLS seed. Bootstrap-only: derived from
+        /// the (public) account so a fresh chain has BLS keys at genesis without
+        /// key distribution. NOT secret — each node overrides it on startup with
+        /// a random key via the external attestor.
+        pub fn bls_seed(authority: &T::AccountId) -> [u8; 32] {
+            sp_io::hashing::blake2_256(&(b"fastlane-bls-seed", authority).encode())
+        }
+
+        /// Canonical message an authority sr25519-signs to register a BLS key:
+        /// blake2_256(b"fastlane-bls-register" ++ public_key).
+        fn bls_register_message(public_key: &[u8]) -> [u8; 32] {
+            let mut msg = b"fastlane-bls-register".to_vec();
+            msg.extend_from_slice(public_key);
+            sp_io::hashing::blake2_256(&msg)
+        }
+
+        /// Shared BLS-attestation logic for `attest_bls` (signed) and
+        /// `attest_bls_unsigned` (OCW). Verifies the authority's single BLS
+        /// signature against its registered key, records it, and once the
+        /// threshold is reached stores the single aggregate signature. Does not
+        /// require the payload to still be `Submitted`, so BLS attestations can
+        /// complete independently of the sr25519 finalisation race.
+        fn do_attest_bls(
+            payload_id: PayloadId,
+            authority: T::AccountId,
+            signature: Vec<u8>,
+        ) -> DispatchResult {
+            let authorities = Authorities::<T>::get();
+            ensure!(authorities.contains(&authority), Error::<T>::NotAuthority);
+
+            let payload = Payloads::<T>::get(payload_id)
+                .ok_or(Error::<T>::PayloadNotFound)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(payload.expiry > now, Error::<T>::PayloadExpired);
+
+            let pubkey = AuthorityBlsKeys::<T>::get(&authority)
+                .ok_or(Error::<T>::BlsKeyNotRegistered)?;
+            ensure!(
+                Self::bls_verify_single(&payload_id, pubkey.as_slice(), &signature),
+                Error::<T>::InvalidBlsSignature
+            );
+
+            let mut recs = BlsAttestations::<T>::get(payload_id);
+            ensure!(
+                !recs.iter().any(|(a, _)| a == &authority),
+                Error::<T>::BlsAlreadyAttested
+            );
+            let sig_bounded: BoundedVec<u8, ConstU32<64>> = signature
+                .try_into()
+                .map_err(|_| Error::<T>::InvalidBlsSignature)?;
+            recs.try_push((authority, sig_bounded))
+                .map_err(|_| Error::<T>::AlreadyAttested)?;
+            BlsAttestations::<T>::insert(payload_id, recs.clone());
+
+            let threshold = Threshold::<T>::get();
+            if threshold > 0 && recs.len() as u32 >= threshold {
+                let sigs: Vec<Vec<u8>> =
+                    recs.iter().map(|(_, s)| s.to_vec()).collect();
+                if let Some(agg) = Self::aggregate_bls_signatures(&sigs) {
+                    // Emit BlsAggregated only the first time the aggregate is
+                    // created. The stored aggregate is still refreshed as more
+                    // sign-offs arrive (so it stays verifiable against the full
+                    // signer set), but the event fires once per payload — not
+                    // once per attestation past the threshold.
+                    let first_time = !BlsAggregate::<T>::contains_key(payload_id);
+                    let agg_bounded: BoundedVec<u8, ConstU32<64>> = agg
+                        .try_into()
+                        .map_err(|_| Error::<T>::InvalidBlsSignature)?;
+                    BlsAggregate::<T>::insert(payload_id, agg_bounded);
+                    if first_time {
+                        Self::deposit_event(Event::BlsAggregated {
+                            payload_id,
+                            count: recs.len() as u32,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// §14 — in-runtime BLS12-381 aggregate verification.
+        ///
+        /// Verifies that `aggregate_sig` is the BLS aggregate of signatures by
+        /// every key in `pubkeys`, each over the same message
+        /// `Message::new(ctx, payload_id)`. Runs entirely inside the runtime
+        /// WASM (no `bls381_*` host function required), so activating real BLS
+        /// is a forkless runtime upgrade — no node-binary rebuild or validator
+        /// redeploy. `pubkeys`/`aggregate_sig` are `w3f_bls` compressed byte
+        /// encodings. This is the on-chain verify half of the BLS path; the OCW
+        /// signing half is wired separately.
+        pub fn verify_bls_aggregate(
+            ctx: &[u8],
+            payload_id: &PayloadId,
+            pubkeys: &[Vec<u8>],
+            aggregate_sig: &[u8],
+        ) -> bool {
+            // Uses only the no_std-available w3f-bls API (the convenience
+            // `single_pop_aggregator` is std-only). Same-message BLS aggregate
+            // verification: the aggregate signature verifies against the SUM of
+            // the signers' public keys.
+            use w3f_bls::{Message, PublicKey, SerializableToBytes, Signature, TinyBLS381};
+            type Engine = TinyBLS381;
+
+            if pubkeys.is_empty() {
+                return false;
+            }
+            let message = Message::new(ctx, payload_id);
+            let sig = match Signature::<Engine>::from_bytes(aggregate_sig) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+
+            // Aggregate the public keys by summing their group points.
+            let mut iter = pubkeys.iter();
+            let mut agg_pk = match PublicKey::<Engine>::from_bytes(iter.next().unwrap()) {
+                Ok(pk) => pk,
+                Err(_) => return false,
+            };
+            for pk_bytes in iter {
+                match PublicKey::<Engine>::from_bytes(pk_bytes) {
+                    Ok(pk) => agg_pk.0 += pk.0,
+                    Err(_) => return false,
+                }
+            }
+
+            sig.verify(&message, &agg_pk)
+        }
+
+        /// Canonical message hash an authority signs to commit to including a
+        /// payload: blake2_256(payload_id ++ b"INCLUDE" ++ deadline.encode()).
+        pub fn inclusion_message_hash(
+            payload_id: &PayloadId,
+            deadline: &BlockNumberFor<T>,
+        ) -> [u8; 32] {
+            let mut msg = payload_id.to_vec();
+            msg.extend_from_slice(b"INCLUDE");
+            msg.extend_from_slice(&deadline.encode());
+            sp_io::hashing::blake2_256(&msg)
+        }
+
+        /// Build the compact aggregate from a payload's signature set. The
+        /// bitmap indexes into the *current* authority ordering; the digest is a
+        /// commitment to the concatenated signatures in authority order.
+        fn build_aggregate(
+            sigs: &BoundedVec<SignatureRecord<T>, T::MaxAuthorities>,
+        ) -> AggregatedAttestation {
+            let authorities = Authorities::<T>::get();
+            let mut bitmap: u64 = 0;
+            let mut digest_input: Vec<u8> = Vec::new();
+            let mut count: u32 = 0;
+
+            for (idx, auth) in authorities.iter().enumerate() {
+                if idx >= 64 {
+                    break;
+                }
+                if let Some(record) = sigs.iter().find(|r| &r.authority == auth) {
+                    bitmap |= 1u64 << idx;
+                    digest_input.extend_from_slice(&record.signature);
+                    count = count.saturating_add(1);
+                }
+            }
+
+            AggregatedAttestation {
+                signer_bitmap: bitmap,
+                digest: sp_io::hashing::blake2_256(&digest_input),
+                count,
+            }
+        }
+
+        /// Remove the full per-authority attestation list and inclusion
+        /// commitments for a finalised payload. The compact
+        /// `AggregatedAttestations` record is retained. Reduces the permanent
+        /// storage footprint of finalised payloads (spec §14).
+        fn prune_finalised_storage(payload_id: PayloadId) {
+            Attestations::<T>::remove(payload_id);
+            InclusionCommitments::<T>::remove(payload_id);
         }
 
         /// Validates on-chain evidence before slashing.
@@ -1125,6 +1814,28 @@ pub mod pallet {
                         !sp_io::crypto::sr25519_verify(&sig, &msg_hash, &pub_key),
                         Error::<T>::MissingSlashProof
                     );
+
+                    Ok(())
+                }
+
+                SlashProof::BrokenInclusion(payload_id) => {
+                    // The authority must have an on-chain inclusion commitment
+                    // for this payload whose deadline has already passed.
+                    let commitments = InclusionCommitments::<T>::get(payload_id);
+                    let commitment = commitments
+                        .iter()
+                        .find(|c| &c.authority == authority)
+                        .ok_or(Error::<T>::MissingSlashProof)?;
+
+                    let now = frame_system::Pallet::<T>::block_number();
+                    ensure!(now > commitment.deadline, Error::<T>::MissingSlashProof);
+
+                    // The promise is only broken if the payload is NOT finalised.
+                    // (If InclusionCommitments were pruned on finalisation the
+                    // lookup above would already fail, but guard explicitly too.)
+                    let status = Statuses::<T>::get(payload_id)
+                        .ok_or(Error::<T>::PayloadNotFound)?;
+                    ensure!(status != Status::Finalised, Error::<T>::MissingSlashProof);
 
                     Ok(())
                 }

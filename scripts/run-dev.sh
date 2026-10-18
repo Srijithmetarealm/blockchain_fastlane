@@ -23,5 +23,5 @@ exec "${NODE_BIN}" \
   --rpc-port 9944 \
   --rpc-cors all \
   --rpc-methods safe \
-  --offchain-worker always \
+  --offchain-worker never \
   --enable-offchain-indexing true

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+frame-benchmarking = { optional = true, workspace = true }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
 sp-std = { workspace = true }
@@ -13,15 +14,21 @@ scale-info = { workspace = true }
 sp-core        = { workspace = true }
 sp-runtime     = { workspace = true }
 log            = { version = "0.4", default-features = false }
+# Real BLS12-381 (§14). no_std so it can compile INTO the runtime WASM and
+# thus deploy forklessly (no validator/node-binary rebuild). Feasibility gate:
+# must build for wasm32-unknown-unknown (watch for a getrandom pull-in).
+w3f-bls = { version = "0.1.9", default-features = false }
 
 [dev-dependencies]
 sp-keyring = { workspace = true, default-features = true }
 pallet-balances = { workspace = true, default-features = true }
+rand = { version = "0.8", default-features = true }
 
 
 [features]
 default = ["std"]
 std = [
+    "frame-benchmarking?/std",
     "frame-support/std",
     "frame-system/std",
     "sp-std/std",
@@ -30,4 +37,11 @@ std = [
     "scale-info/std",
     "sp-core/std",
     "sp-runtime/std",
+    "w3f-bls/std",
+]
+runtime-benchmarks = [
+    "frame-benchmarking/runtime-benchmarks",
+    "frame-support/runtime-benchmarks",
+    "frame-system/runtime-benchmarks",
+    "sp-runtime/runtime-benchmarks",
 ]

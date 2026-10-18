@@ -9,7 +9,7 @@ use crate as pallet_fastlane;
 
 use frame_support::{
     derive_impl, parameter_types,
-    traits::{ConstU128, ConstU32},
+    traits::{ConstU128, ConstU32, ConstU64},
 };
 use frame_system::offchain::{
     AppCrypto, CreateInherent, CreateSignedTransaction, CreateTransactionBase,
@@ -53,6 +53,24 @@ impl pallet_balances::Config for Test {
 
 parameter_types! {
     pub AllowedDomains: Vec<u32> = Vec::new();
+    // Settable per-test so rate-limit tests can enable it; 0 elsewhere.
+    pub storage MockSubmitCooldown: BlockNumber = 0;
+}
+
+/// Test KYC provider: everyone is verified except `//Banned`.
+pub struct MockKyc;
+impl pallet_fastlane::KycProvider<AccountId> for MockKyc {
+    fn is_verified(who: &AccountId) -> bool {
+        *who != account("//Banned")
+    }
+}
+
+/// Test domain rules: every domain is allowed except 99.
+pub struct MockDomainRules;
+impl pallet_fastlane::DomainRules<AccountId> for MockDomainRules {
+    fn is_allowed(_creator: &AccountId, domain: u32, _payload_hash: &[u8; 32]) -> bool {
+        domain != 99
+    }
 }
 
 impl SigningTypes for Test {
@@ -92,7 +110,11 @@ impl pallet_fastlane::Config for Test {
     type AllowedDomains = AllowedDomains;
     type OffchainChecks = ();
     type MaxAutoFinalizePerBlock = ConstU32<5>;
+    type FinalizeDelay = ConstU64<1>;
     type MaxExpiriesPerBlock = ConstU32<5>;
+    type KycProvider = MockKyc;
+    type DomainRules = MockDomainRules;
+    type SubmitCooldown = MockSubmitCooldown;
     type WeightInfo = ();
     type OnFinalised = ();
 }
@@ -124,6 +146,21 @@ pub fn sign_attestation(
     let mut msg = payload_id.to_vec();
     msg.extend_from_slice(&expiry.encode());
     msg.extend_from_slice(&checks_hash);
+    let msg_hash = sp_io::hashing::blake2_256(&msg);
+    pair.sign(&msg_hash).0.to_vec()
+}
+
+/// Sign the canonical FastLane inclusion-commitment message:
+///   blake2_256(payload_id ++ b"INCLUDE" ++ deadline.encode())
+pub fn sign_inclusion(
+    pair: &sr25519::Pair,
+    payload_id: [u8; 32],
+    deadline: BlockNumber,
+) -> Vec<u8> {
+    use codec::Encode;
+    let mut msg = payload_id.to_vec();
+    msg.extend_from_slice(b"INCLUDE");
+    msg.extend_from_slice(&deadline.encode());
     let msg_hash = sp_io::hashing::blake2_256(&msg);
     pair.sign(&msg_hash).0.to_vec()
 }

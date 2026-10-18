@@ -6067,17 +6067,20 @@ dependencies = [
 name = "pallet-fastlane"
 version = "0.1.0"
 dependencies = [
+ "frame-benchmarking",
  "frame-support",
  "frame-system",
  "log",
  "pallet-balances",
  "parity-scale-codec",
+ "rand 0.8.5",
  "scale-info",
  "sp-core",
  "sp-io",
  "sp-keyring",
  "sp-runtime",
  "sp-std",
+ "w3f-bls",
 ]
 
 [[package]]
@@ -6148,6 +6151,7 @@ dependencies = [
  "frame-benchmarking",
  "frame-support",
  "frame-system",
+ "pallet-fastlane",
  "parity-scale-codec",
  "scale-info",
  "sp-core",

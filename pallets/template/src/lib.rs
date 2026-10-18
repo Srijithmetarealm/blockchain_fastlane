@@ -67,6 +67,9 @@ pub mod pallet {
 	use super::*;
 	use frame_support::pallet_prelude::*;
 	use frame_system::pallet_prelude::*;
+	// Bring the FastLane gateway trait into scope so we can call
+	// `ensure_preconsensed` on the configured `PreConsensusGate`.
+	use pallet_fastlane::EnsurePreConsensed;
 
 	// The `Pallet` struct serves as a placeholder to implement traits, methods and dispatchables
 	// (`Call`s) in this pallet.
@@ -84,6 +87,11 @@ pub mod pallet {
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 		/// A type representing the weights required by the dispatchables of this pallet.
 		type WeightInfo: WeightInfo;
+		/// The FastLane pre-consensus gateway. Gated dispatchables only proceed
+		/// once the referenced payload has been pre-consensed (or finalised).
+		/// In the runtime this is bound to `Fastlane`, making FastLane a
+		/// mandatory checkpoint for this pallet's state changes (spec §11).
+		type PreConsensusGate: EnsurePreConsensed;
 	}
 
 	/// A storage item for this pallet.
@@ -179,6 +187,30 @@ pub mod pallet {
 		/// - If no value has been set ([`Error::NoneValue`])
 		/// - If incrementing the value in storage causes an arithmetic overflow
 		///   ([`Error::StorageOverflow`])
+		/// A FastLane-gated version of `do_something`.
+		///
+		/// The state change (writing `something` to storage) is only applied if
+		/// `payload_id` has already reached pre-consensus in FastLane. If it has
+		/// not, `ensure_preconsensed` returns an error and no state is mutated —
+		/// demonstrating FastLane as a mandatory approval checkpoint (spec §11).
+		#[pallet::call_index(2)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn do_something_gated(
+			origin: OriginFor<T>,
+			payload_id: pallet_fastlane::PayloadId,
+			something: u32,
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+
+			// Mandatory FastLane checkpoint: refuse to act unless the payload
+			// has been pre-consensed (or finalised) by the committee.
+			T::PreConsensusGate::ensure_preconsensed(payload_id)?;
+
+			Something::<T>::put(something);
+			Self::deposit_event(Event::SomethingStored { something, who });
+			Ok(())
+		}
+
 		#[pallet::call_index(1)]
 		#[pallet::weight(T::WeightInfo::cause_error())]
 		pub fn cause_error(origin: OriginFor<T>) -> DispatchResult {

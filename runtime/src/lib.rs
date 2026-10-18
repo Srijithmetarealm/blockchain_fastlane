@@ -72,10 +72,61 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	//   `spec_version`, and `authoring_version` are the same between Wasm and native.
 	// This value is set to 100 to notify Polkadot-JS App (https://polkadot.js.org/apps) to use
 	//   the compatible custom types.
-	spec_version: 100,
+	// Bumped 100 -> 101 for the forkless runtime upgrade that adds the §14
+	// features (commit_inclusion extrinsic, AggregatedAttestations /
+	// InclusionCommitments storage). A full node uses the on-chain Wasm runtime
+	// whenever this differs from its native version, so no validator restart is
+	// needed for the upgrade to take effect.
+	// 101 -> 102: deferred auto-finalisation (FinalizeDelay + FinalizeAt schedule)
+	// so PreConsensed payloads have a window for §14 inclusion commitments.
+	// 102 -> 103: FinalizeDelay 10 -> 2. The 10-block hold (~60s) outlived
+	// GRANDPA finality (~3 blocks) while no automatic producer of inclusion
+	// commitments existed, so it delayed the Finalised flag without adding
+	// safety. Storage layout is unchanged — only the schedule offset moves.
+	// 103 -> 104: §11 integration. The template pallet gains a FastLane-gated
+	// extrinsic (`do_something_gated`) bound to `type PreConsensusGate =
+	// Fastlane`, making FastLane an enforced pre-consensus checkpoint for a
+	// downstream pallet. Additive, backward-compatible; no storage migration.
+	// 104 -> 105: §14 real on-chain BLS. Adds register_bls_key (call 9) and
+	// attest_bls (call 10) plus AuthorityBlsKeys / BlsAttestations / BlsAggregate
+	// storage. Purely additive: new call indices and new (empty-by-default)
+	// storage, existing sr25519 attestation flow untouched. No migration.
+	// 105 -> 106: OCW auto-BLS (attest_bls_unsigned, call 11) + genesis BLS keys
+	// + set_authorities now auto-registers a BLS key for each new authority, so
+	// BLS keeps working after governance authority changes. Additive; no migration.
+	// 106 -> 107: BlsAggregated event now fires once per payload (when the
+	// aggregate is first created) instead of once per attestation past the
+	// threshold. Behaviour-only; no storage change.
+	// 107 -> 108: production BLS keys. Each node generates a RANDOM per-node BLS
+	// secret (offchain-local storage) and self-registers its public key via
+	// register_bls_key_unsigned (call 12), proven by an sr25519 signature — BLS
+	// keys are no longer derived from public accounts. Account-derived genesis
+	// keys remain only as a bootstrap that nodes override on startup.
+	// 108 -> 109: dedicated (conservative) weights for the BLS extrinsics — an
+	// in-runtime BLS pairing verify is ~100x an sr25519 verify, so the previous
+	// reuse of attest() weight under-priced them (DoS risk). Weights-only.
+	// 109 -> 110: replace conservative BLS weights with BENCHMARKED values
+	// (register_bls_key ~4.3ms, attest_bls ~49.5ms). The 6ms estimate was itself
+	// 8x too low — benchmarks matter. Weights-only.
+	// 110 -> 111: production hardening. §7 real checks — a pluggable KycProvider
+	// gate and a per-creator SubmitCooldown rate limit in submit() (both no-op
+	// by config on this testnet). §14 bootstrap-key window closed — BLS keys are
+	// no longer set at genesis/set_authorities; nodes self-register random keys.
+	// 111 -> 112: §7 domain-specific rules are now a pluggable DomainRules hook
+	// (default allow-all) evaluated in the OCW's compute_checks_hash — the last
+	// hardcoded `true` check is gone. Output-equivalent under the default
+	// providers, so checks_hash is unchanged on this testnet.
+	spec_version: 113,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,
-	transaction_version: 1,
+	// Bumped 1 -> 2 because a new extrinsic (call index 8) was added to the
+	// Fastlane pallet's Call enum, changing the transaction interface.
+	// 2 -> 3: template pallet gained a new extrinsic (call index 2,
+	// `do_something_gated`), extending the transaction interface again.
+	// 3 -> 4: fastlane gained register_bls_key (9) and attest_bls (10).
+	// 4 -> 5: fastlane gained attest_bls_unsigned (11).
+	// 5 -> 6: fastlane gained register_bls_key_unsigned (12).
+	transaction_version: 6,
 	system_version: 1,
 };
 
